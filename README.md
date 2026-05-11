@@ -1,0 +1,2 @@
+# freebsd-if-bridge-snooping
+

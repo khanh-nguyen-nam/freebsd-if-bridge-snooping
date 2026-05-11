@@ -1,3 +1,6 @@
+.DS_Store
+*.core
+
 # ---> C
 # Prerequisites
 *.d
@@ -55,3 +58,11 @@ dkms.conf
 # debug information files
 *.dwo
 
+*.orig
+*.rej
+*.pcap
+*.swp
+*.tmp
+worktrees/
+out/
+tmp/

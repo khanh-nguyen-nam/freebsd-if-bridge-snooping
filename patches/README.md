@@ -1,13 +1,10 @@
 # Patches
 
-This directory contains exported patch series and review snapshots.
+This directory is reserved for exported patch series and review snapshots.
 
-Current review artifacts:
+Suggested layout:
 
-- `0001-if-bridge-add-group-fwd-mask-control.patch`
-
-Suggested future layout:
-
+- `0001-group-fwd-mask.patch`
 - `series-v1/`
 - `series-v2/`
 

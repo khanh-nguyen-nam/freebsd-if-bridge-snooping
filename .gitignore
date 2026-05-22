@@ -61,6 +61,8 @@ dkms.conf
 *.orig
 *.rej
 *.pcap
+*.pdf
+*.zip
 *.swp
 *.tmp
 worktrees/

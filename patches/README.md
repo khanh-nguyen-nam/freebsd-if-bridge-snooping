@@ -1,11 +1,3 @@
 # Patches
 
-This directory is reserved for exported patch series and review snapshots.
-
-Suggested layout:
-
-- `0001-group-fwd-mask.patch`
-- `series-v1/`
-- `series-v2/`
-
-Keep patches small and ordered to match the proposal phases.
+- `0001-if-bridge-group-fwd-mask.patch`: Deliverable 1 patch for FreeBSD `if_bridge(4)`.

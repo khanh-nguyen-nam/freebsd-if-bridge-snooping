@@ -1,0 +1,299 @@
+diff --git a/lib/libifconfig/libifconfig.h b/lib/libifconfig/libifconfig.h
+index 03a0d0b19..96228926b 100644
+--- a/lib/libifconfig/libifconfig.h
++++ b/lib/libifconfig/libifconfig.h
+@@ -67,6 +67,7 @@ struct ifconfig_bridge_status {
+ 	size_t members_count;		/**< how many member interfaces */
+ 	uint32_t cache_size;		/**< size of address cache */
+ 	uint32_t cache_lifetime;	/**< address cache entry lifetime */
++	uint16_t group_fwd_mask;	/**< link-local reserved group mask */
+ };
+ 
+ struct ifconfig_capabilities {
+diff --git a/lib/libifconfig/libifconfig_bridge.c b/lib/libifconfig/libifconfig_bridge.c
+index 2a9bbc358..fdf71c8f8 100644
+--- a/lib/libifconfig/libifconfig_bridge.c
++++ b/lib/libifconfig/libifconfig_bridge.c
+@@ -66,6 +66,7 @@ ifconfig_bridge_get_bridge_status(ifconfig_handle_t *h,
+ {
+ 	struct ifbifconf members;
+ 	struct ifbrparam cache_param;
++	struct ifbrparam fwd_mask_param;
+ 	struct _ifconfig_bridge_status *bridge;
+ 	char *buf;
+ 
+@@ -93,6 +94,13 @@ ifconfig_bridge_get_bridge_status(ifconfig_handle_t *h,
+ 	}
+ 	bridge->inner.cache_lifetime = cache_param.ifbrp_ctime;
+ 
++	if (ifconfig_bridge_ioctlwrap(h, name, BRDGGFWDMASK,
++	    &fwd_mask_param, sizeof(fwd_mask_param), false) != 0) {
++		free(bridge);
++		return (-1);
++	}
++	bridge->inner.group_fwd_mask = fwd_mask_param.ifbrp_group_fwd_mask;
++
+ 	if (ifconfig_bridge_ioctlwrap(h, name, BRDGPARAM,
+ 	    &bridge->params, sizeof(bridge->params), false) != 0) {
+ 		free(bridge);
+diff --git a/sbin/ifconfig/ifbridge.c b/sbin/ifconfig/ifbridge.c
+index 9d3296ea6..4e0677fb8 100644
+--- a/sbin/ifconfig/ifbridge.c
++++ b/sbin/ifconfig/ifbridge.c
+@@ -186,6 +186,7 @@ bridge_status(if_ctx *ctx)
+ 	    stpproto[params->ifbop_protocol],
+ 	    bridge->cache_size,
+ 	    bridge->cache_lifetime);
++	printf("\tgroup_fwd_mask 0x%04x\n", bridge->group_fwd_mask);
+ 	PV2ID(params->ifbop_designated_root, bprio, lladdr);
+ 	printf("\troot id %s priority %d ifcost %u port %u\n",
+ 	    ether_ntoa((struct ether_addr *)lladdr),
+@@ -660,6 +661,21 @@ setbridge_timeout(if_ctx *ctx, const char *arg, int dummy __unused)
+ 		err(1, "BRDGSTO %s",  arg);
+ }
+ 
++static void
++setbridge_group_fwd_mask(if_ctx *ctx, const char *arg, int dummy __unused)
++{
++	struct ifbrparam param;
++	u_long val;
++
++	if (get_val(arg, &val) < 0 || (val & ~0xffff) != 0)
++		errx(1, "invalid value: %s", arg);
++
++	param.ifbrp_group_fwd_mask = val & 0xffff;
++
++	if (do_cmd(ctx, BRDGSFWDMASK, &param, sizeof(param), 1) < 0)
++		err(1, "BRDGSFWDMASK %s", arg);
++}
++
+ static void
+ setbridge_private(if_ctx *ctx, const char *val, int dummy __unused)
+ {
+@@ -711,6 +727,7 @@ static struct cmd bridge_cmds[] = {
+ 	DEF_CMD_ARG2("ifpathcost",	setbridge_ifpathcost),
+ 	DEF_CMD_ARG2("ifmaxaddr",	setbridge_ifmaxaddr),
+ 	DEF_CMD_ARG("timeout",		setbridge_timeout),
++	DEF_CMD_ARG("group_fwd_mask",	setbridge_group_fwd_mask),
+ 	DEF_CMD_ARG("private",		setbridge_private),
+ 	DEF_CMD_ARG("-private",		unsetbridge_private),
+ };
+diff --git a/share/man/man4/bridge.4 b/share/man/man4/bridge.4
+index da47ba62b..7e44c3773 100644
+--- a/share/man/man4/bridge.4
++++ b/share/man/man4/bridge.4
+@@ -121,6 +121,28 @@ interfaces that are part of the bridge.
+ For unicast traffic, the bridge learns which MAC addresses are associated
+ with which interfaces and will forward the traffic selectively.
+ .Pp
++By default,
++.Nm
++does not forward destination MAC addresses in the reserved link-local range
++.Li 01:80:c2:00:00:00
++through
++.Li 01:80:c2:00:00:0f .
++The
++.Xr ifconfig 8
++command
++.Cm group_fwd_mask
++accepts a 16-bit mask that selectively enables forwarding for this range.
++Bit
++.Ar n
++controls whether frames destined to
++.Li 01:80:c2:00:00:0n
++are forwarded across bridge member ports.
++For example, a mask of
++.Li 0x4000
++allows forwarding of
++.Li 01:80:c2:00:00:0e
++frames while leaving the remaining reserved destinations filtered.
++.Pp
+ By default the bridge logs MAC address port flapping to
+ .Xr syslog 3 .
+ This behavior can be disabled by setting the
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+index 0f4ec01fb..17d24141a 100644
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -277,6 +277,7 @@ struct bridge_softc {
+ 	LIST_ENTRY(bridge_softc) sc_list;
+ 	struct sx		sc_sx;
+ 	struct mtx		sc_rt_mtx;
++	uint16_t		sc_group_fwd_mask; /* link-local group fwd mask */
+ 	uint32_t		sc_brtmax;	/* max # of addresses */
+ 	uint32_t		sc_brtcnt;	/* cur. # of addresses */
+ 	uint32_t		sc_brttimeout;	/* rt timeout in seconds */
+@@ -402,6 +403,8 @@ static int	bridge_ioctl_grte(struct bridge_softc *, void *);
+ static int	bridge_ioctl_gifsstp(struct bridge_softc *, void *);
+ static int	bridge_ioctl_sproto(struct bridge_softc *, void *);
+ static int	bridge_ioctl_stxhc(struct bridge_softc *, void *);
++static int	bridge_ioctl_gfwdmask(struct bridge_softc *, void *);
++static int	bridge_ioctl_sfwdmask(struct bridge_softc *, void *);
+ static int	bridge_pfil(struct mbuf **, struct ifnet *, struct ifnet *,
+ 		    int);
+ #ifdef INET
+@@ -414,6 +417,8 @@ static int	bridge_ip6_checkbasic(struct mbuf **mp);
+ #endif /* INET6 */
+ static void	bridge_linkstate(struct ifnet *ifp);
+ static void	bridge_linkcheck(struct bridge_softc *sc);
++static bool	bridge_rsvd_link_local_enabled(struct bridge_softc *,
++		    const uint8_t *);
+ 
+ /*
+  * Use the "null" value from IEEE 802.1Q-2014 Table 9-2
+@@ -613,6 +618,12 @@ static const struct bridge_control bridge_control_table[] = {
+ 	{ bridge_ioctl_sifmaxaddr,	sizeof(struct ifbreq),
+ 	  BC_F_COPYIN|BC_F_SUSER },
+ 
++	{ bridge_ioctl_gfwdmask,	sizeof(struct ifbrparam),
++	  BC_F_COPYOUT },
++
++	{ bridge_ioctl_sfwdmask,	sizeof(struct ifbrparam),
++	  BC_F_COPYIN|BC_F_SUSER },
++
+ };
+ static const int bridge_control_table_size = nitems(bridge_control_table);
+ 
+@@ -772,6 +783,7 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
+ 	ifp = sc->sc_ifp = if_alloc(IFT_ETHER);
+ 
+ 	BRIDGE_LOCK_INIT(sc);
++	sc->sc_group_fwd_mask = 0;
+ 	sc->sc_brtmax = BRIDGE_RTABLE_MAX;
+ 	sc->sc_brttimeout = BRIDGE_RTABLE_TIMEOUT;
+ 
+@@ -827,6 +839,19 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
+ 	return (0);
+ }
+ 
++static bool
++bridge_rsvd_link_local_enabled(struct bridge_softc *sc, const uint8_t *dst)
++{
++	uint16_t bit;
++
++	if (dst[0] != 0x01 || dst[1] != 0x80 || dst[2] != 0xc2 ||
++	    dst[3] != 0x00 || dst[4] != 0x00 || dst[5] > 0x0f)
++		return (false);
++
++	bit = (uint16_t)1 << dst[5];
++	return ((sc->sc_group_fwd_mask & bit) != 0);
++}
++
+ static void
+ bridge_clone_destroy_cb(struct epoch_context *ctx)
+ {
+@@ -2005,6 +2030,24 @@ bridge_ioctl_stxhc(struct bridge_softc *sc, void *arg)
+ 	return (bstp_set_holdcount(&sc->sc_stp, param->ifbrp_txhc));
+ }
+ 
++static int
++bridge_ioctl_gfwdmask(struct bridge_softc *sc, void *arg)
++{
++	struct ifbrparam *param = arg;
++
++	param->ifbrp_group_fwd_mask = sc->sc_group_fwd_mask;
++	return (0);
++}
++
++static int
++bridge_ioctl_sfwdmask(struct bridge_softc *sc, void *arg)
++{
++	struct ifbrparam *param = arg;
++
++	sc->sc_group_fwd_mask = param->ifbrp_group_fwd_mask;
++	return (0);
++}
++
+ /*
+  * bridge_ifdetach:
+  *
+@@ -2461,12 +2504,12 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+ 			goto drop;
+ 	} else {
+ 		/*
+-		 * Check if its a reserved multicast address, any address
+-		 * listed in 802.1D section 7.12.6 may not be forwarded by the
+-		 * bridge.
+-		 * This is currently 01-80-C2-00-00-00 to 01-80-C2-00-00-0F
++		 * Reserved link-local destinations in the
++		 * 01-80-C2-00-00-[00,0F] range are filtered unless the
++		 * corresponding bit is enabled in group_fwd_mask.
+ 		 */
+-		if (dst[0] == 0x01 && dst[1] == 0x80 &&
++		if (!bridge_rsvd_link_local_enabled(sc, dst) &&
++		    dst[0] == 0x01 && dst[1] == 0x80 &&
+ 		    dst[2] == 0xc2 && dst[3] == 0x00 &&
+ 		    dst[4] == 0x00 && dst[5] <= 0x0f)
+ 			goto drop;
+diff --git a/sys/net/if_bridgevar.h b/sys/net/if_bridgevar.h
+index 511ca7538..2fa9d8623 100644
+--- a/sys/net/if_bridgevar.h
++++ b/sys/net/if_bridgevar.h
+@@ -122,6 +122,8 @@
+ #define	BRDGSPROTO		28	/* set protocol (ifbrparam) */
+ #define	BRDGSTXHC		29	/* set tx hold count (ifbrparam) */
+ #define	BRDGSIFAMAX		30	/* set max interface addrs (ifbreq) */
++#define	BRDGGFWDMASK		31	/* get group_fwd_mask (ifbrparam) */
++#define	BRDGSFWDMASK		32	/* set group_fwd_mask (ifbrparam) */
+ 
+ /*
+  * Generic bridge control request.
+@@ -224,6 +226,8 @@ struct ifbrparam {
+ #define	ifbrp_csize	ifbrp_ifbrpu.ifbrpu_int32	/* cache size */
+ #define	ifbrp_ctime	ifbrp_ifbrpu.ifbrpu_int32	/* cache time (sec) */
+ #define	ifbrp_prio	ifbrp_ifbrpu.ifbrpu_int16	/* bridge priority */
++#define	ifbrp_group_fwd_mask ifbrp_ifbrpu.ifbrpu_int16 /* reserved group
++							 * fwd mask */
+ #define	ifbrp_proto	ifbrp_ifbrpu.ifbrpu_int8	/* bridge protocol */
+ #define	ifbrp_txhc	ifbrp_ifbrpu.ifbrpu_int8	/* bpdu tx holdcount */
+ #define	ifbrp_hellotime	ifbrp_ifbrpu.ifbrpu_int8	/* hello time (sec) */
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+index 8fe3c4ac7..99e5b41b6 100755
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -789,6 +789,37 @@ many_bridge_members_cleanup()
+ 	vnet_cleanup
+ }
+ 
++atf_test_case "group_fwd_mask" "cleanup"
++group_fwd_mask_head()
++{
++	atf_set descr 'bridge group_fwd_mask control path'
++	atf_set require.user root
++}
++
++group_fwd_mask_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge=$(vnet_mkbridge)
++
++	atf_check -s exit:0 -o match:'group_fwd_mask 0x0000' \
++	    ifconfig ${bridge}
++	atf_check -s exit:0 ifconfig ${bridge} group_fwd_mask 0x4000
++	atf_check -s exit:0 -o match:'group_fwd_mask 0x4000' \
++	    ifconfig ${bridge}
++	atf_check -s exit:0 ifconfig ${bridge} group_fwd_mask 0x8
++	atf_check -s exit:0 -o match:'group_fwd_mask 0x0008' \
++	    ifconfig ${bridge}
++	atf_check -s exit:1 -e ignore \
++	    ifconfig ${bridge} group_fwd_mask 0x10000
++}
++
++group_fwd_mask_cleanup()
++{
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -931,6 +962,7 @@ atf_init_test_cases()
+ 	atf_add_test_case "mtu"
+ 	atf_add_test_case "vlan"
+ 	atf_add_test_case "many_bridge_members"
++	atf_add_test_case "group_fwd_mask"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

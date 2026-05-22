@@ -74,7 +74,9 @@ group_fwd_mask 0x0008
 Observed result:
 
 ```text
+group_fwd_mask 0x0000
 group_fwd_mask 0x4000
+group_fwd_mask 0x0008
 ```
 
 Additional checks:

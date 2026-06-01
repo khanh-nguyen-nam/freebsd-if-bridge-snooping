@@ -1,0 +1,510 @@
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+index 17d24141a..e76b92969 100644
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -189,6 +189,13 @@
+ #define	BRIDGE_RTABLE_PRUNE_PERIOD	(5 * 60)
+ #endif
+ 
++/*
++ * Number of seconds between walks of the multicast database member list.
++ */
++#ifndef BRIDGE_MDB_PRUNE_PERIOD
++#define	BRIDGE_MDB_PRUNE_PERIOD		(5 * 60)
++#endif
++
+ /*
+  * List of capabilities to possibly mask on the member interface.
+  */
+@@ -210,7 +217,7 @@
+  * That is: for read accesses we only need to be in NET_EPOCH, but for write
+  * accesses we must hold:
+  *
+- *  - BRIDGE_RT_LOCK, for any change to bridge_rtnodes
++ *  - BRIDGE_RT_LOCK, for any change to bridge_rtnodes or MDB state
+  *  - BRIDGE_LOCK, for any other change
+  *
+  * The BRIDGE_LOCK is a sleepable lock, because it is held across ioctl()
+@@ -269,6 +276,31 @@ struct bridge_rtnode {
+ };
+ #define	brt_ifp			brt_dst->bif_ifp
+ 
++/*
++ * Bridge multicast database entry.  The MDB records which member interfaces
++ * have listeners for a multicast group.
++ */
++struct bridge_mdb_key {
++	sa_family_t		bmk_family;
++	ether_vlanid_t		bmk_vlan;
++	union {
++		struct in_addr	bmk_ip4;
++		struct in6_addr	bmk_ip6;
++	} bmk_addr;
++};
++
++struct bridge_mdb_member {
++	CK_LIST_ENTRY(bridge_mdb_member) bmm_next;
++	struct bridge_iflist	*bmm_bif;
++	unsigned long		bmm_expire;
++};
++
++struct bridge_mdb_entry {
++	CK_LIST_ENTRY(bridge_mdb_entry) bmd_next;
++	struct bridge_mdb_key	bmd_key;
++	CK_LIST_HEAD(, bridge_mdb_member) bmd_members;
++};
++
+ /*
+  * Software state for each bridge.
+  */
+@@ -282,9 +314,13 @@ struct bridge_softc {
+ 	uint32_t		sc_brtcnt;	/* cur. # of addresses */
+ 	uint32_t		sc_brttimeout;	/* rt timeout in seconds */
+ 	struct callout		sc_brcallout;	/* bridge callout */
++	struct callout		sc_mdbcallout;	/* MDB aging callout */
+ 	CK_LIST_HEAD(, bridge_iflist) sc_iflist;	/* member interface list */
+ 	CK_LIST_HEAD(, bridge_rtnode) *sc_rthash;	/* our forwarding table */
+ 	CK_LIST_HEAD(, bridge_rtnode) sc_rtlist;	/* list version of above */
++	CK_LIST_HEAD(, bridge_mdb_entry) sc_mdb;	/* multicast database */
++	uint32_t		sc_mdbcnt;	/* # of multicast groups */
++	uint32_t		sc_mdbmembercnt; /* # of multicast members */
+ 	uint32_t		sc_rthash_key;	/* key for hash */
+ 	CK_LIST_HEAD(, bridge_iflist) sc_spanlist;	/* span ports list */
+ 	struct bstp_state	sc_stp;		/* STP state */
+@@ -335,6 +371,7 @@ static void	bridge_forward(struct bridge_softc *, struct bridge_iflist *,
+ static bool	bridge_member_ifaddrs(void);
+ 
+ static void	bridge_timer(void *);
++static void	bridge_mdb_timer(void *);
+ 
+ static void	bridge_broadcast(struct bridge_softc *, struct ifnet *,
+ 		    struct mbuf *, int);
+@@ -352,6 +389,14 @@ static int	bridge_rtdaddr(struct bridge_softc *, const uint8_t *,
+ 
+ static void	bridge_rtable_init(struct bridge_softc *);
+ static void	bridge_rtable_fini(struct bridge_softc *);
++static void	bridge_mdb_init(struct bridge_softc *);
++static void	bridge_mdb_fini(struct bridge_softc *);
++static void	bridge_mdb_prune(struct bridge_softc *);
++static void	bridge_mdb_flush_member(struct bridge_softc *,
++		    struct bridge_iflist *);
++static int	bridge_mdb_add_member(struct bridge_softc *, sa_family_t,
++		    const void *, ether_vlanid_t, struct bridge_iflist *,
++		    unsigned int) __unused;
+ 
+ static int	bridge_rtnode_addr_cmp(const uint8_t *, const uint8_t *);
+ static struct bridge_rtnode *bridge_rtnode_lookup(struct bridge_softc *,
+@@ -789,8 +834,10 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
+ 
+ 	/* Initialize our routing table. */
+ 	bridge_rtable_init(sc);
++	bridge_mdb_init(sc);
+ 
+ 	callout_init_mtx(&sc->sc_brcallout, &sc->sc_rt_mtx, 0);
++	callout_init_mtx(&sc->sc_mdbcallout, &sc->sc_rt_mtx, 0);
+ 
+ 	CK_LIST_INIT(&sc->sc_iflist);
+ 	CK_LIST_INIT(&sc->sc_spanlist);
+@@ -852,6 +899,241 @@ bridge_rsvd_link_local_enabled(struct bridge_softc *sc, const uint8_t *dst)
+ 	return ((sc->sc_group_fwd_mask & bit) != 0);
+ }
+ 
++static void
++bridge_mdb_init(struct bridge_softc *sc)
++{
++	CK_LIST_INIT(&sc->sc_mdb);
++	sc->sc_mdbcnt = 0;
++	sc->sc_mdbmembercnt = 0;
++}
++
++static int
++bridge_mdb_key_init(struct bridge_mdb_key *key, sa_family_t family,
++    const void *addr, ether_vlanid_t vlan)
++{
++	memset(key, 0, sizeof(*key));
++	key->bmk_family = family;
++	key->bmk_vlan = vlan;
++
++	switch (family) {
++#ifdef INET
++	case AF_INET:
++		memcpy(&key->bmk_addr.bmk_ip4, addr, sizeof(struct in_addr));
++		return (0);
++#endif
++#ifdef INET6
++	case AF_INET6:
++		memcpy(&key->bmk_addr.bmk_ip6, addr, sizeof(struct in6_addr));
++		return (0);
++#endif
++	default:
++		return (EAFNOSUPPORT);
++	}
++}
++
++static bool
++bridge_mdb_key_equal(const struct bridge_mdb_key *a,
++    const struct bridge_mdb_key *b)
++{
++	if (a->bmk_family != b->bmk_family || a->bmk_vlan != b->bmk_vlan)
++		return (false);
++
++	switch (a->bmk_family) {
++#ifdef INET
++	case AF_INET:
++		return (memcmp(&a->bmk_addr.bmk_ip4, &b->bmk_addr.bmk_ip4,
++		    sizeof(struct in_addr)) == 0);
++#endif
++#ifdef INET6
++	case AF_INET6:
++		return (memcmp(&a->bmk_addr.bmk_ip6, &b->bmk_addr.bmk_ip6,
++		    sizeof(struct in6_addr)) == 0);
++#endif
++	default:
++		return (false);
++	}
++}
++
++static struct bridge_mdb_entry *
++bridge_mdb_lookup(struct bridge_softc *sc, const struct bridge_mdb_key *key)
++{
++	struct bridge_mdb_entry *bmd;
++
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	CK_LIST_FOREACH(bmd, &sc->sc_mdb, bmd_next) {
++		if (bridge_mdb_key_equal(&bmd->bmd_key, key))
++			return (bmd);
++	}
++
++	return (NULL);
++}
++
++static struct bridge_mdb_member *
++bridge_mdb_member_lookup(struct bridge_mdb_entry *bmd,
++    struct bridge_iflist *bif)
++{
++	struct bridge_mdb_member *bmm;
++
++	CK_LIST_FOREACH(bmm, &bmd->bmd_members, bmm_next) {
++		if (bmm->bmm_bif == bif)
++			return (bmm);
++	}
++
++	return (NULL);
++}
++
++static void
++bridge_mdb_destroy_entry(struct bridge_softc *sc, struct bridge_mdb_entry *bmd)
++{
++	struct bridge_mdb_member *bmm;
++
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	while ((bmm = CK_LIST_FIRST(&bmd->bmd_members)) != NULL) {
++		CK_LIST_REMOVE(bmm, bmm_next);
++		sc->sc_mdbmembercnt--;
++		free(bmm, M_DEVBUF);
++	}
++
++	CK_LIST_REMOVE(bmd, bmd_next);
++	sc->sc_mdbcnt--;
++	free(bmd, M_DEVBUF);
++}
++
++static bool
++bridge_mdb_remove_member(struct bridge_softc *sc, struct bridge_mdb_entry *bmd,
++    struct bridge_mdb_member *bmm)
++{
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	CK_LIST_REMOVE(bmm, bmm_next);
++	sc->sc_mdbmembercnt--;
++	free(bmm, M_DEVBUF);
++
++	if (!CK_LIST_EMPTY(&bmd->bmd_members))
++		return (false);
++
++	CK_LIST_REMOVE(bmd, bmd_next);
++	sc->sc_mdbcnt--;
++	free(bmd, M_DEVBUF);
++	return (true);
++}
++
++static int
++bridge_mdb_add_member(struct bridge_softc *sc, sa_family_t family,
++    const void *addr, ether_vlanid_t vlan, struct bridge_iflist *bif,
++    unsigned int lifetime)
++{
++	struct bridge_mdb_entry *bmd, *new_bmd;
++	struct bridge_mdb_member *bmm, *new_bmm;
++	struct bridge_mdb_key key;
++	bool created_bmd;
++	int error;
++
++	error = bridge_mdb_key_init(&key, family, addr, vlan);
++	if (error != 0)
++		return (error);
++
++	new_bmd = malloc(sizeof(*new_bmd), M_DEVBUF, M_NOWAIT | M_ZERO);
++	if (new_bmd != NULL) {
++		new_bmd->bmd_key = key;
++		CK_LIST_INIT(&new_bmd->bmd_members);
++	}
++
++	new_bmm = malloc(sizeof(*new_bmm), M_DEVBUF, M_NOWAIT | M_ZERO);
++	if (new_bmm != NULL)
++		new_bmm->bmm_bif = bif;
++
++	created_bmd = false;
++	BRIDGE_RT_LOCK(sc);
++	bmd = bridge_mdb_lookup(sc, &key);
++	if (bmd == NULL) {
++		if (new_bmd == NULL) {
++			error = ENOMEM;
++			goto out;
++		}
++		bmd = new_bmd;
++		new_bmd = NULL;
++		CK_LIST_INSERT_HEAD(&sc->sc_mdb, bmd, bmd_next);
++		sc->sc_mdbcnt++;
++		created_bmd = true;
++	}
++
++	bmm = bridge_mdb_member_lookup(bmd, bif);
++	if (bmm == NULL) {
++		if (new_bmm == NULL) {
++			if (created_bmd)
++				bridge_mdb_destroy_entry(sc, bmd);
++			error = ENOMEM;
++			goto out;
++		}
++		bmm = new_bmm;
++		new_bmm = NULL;
++		CK_LIST_INSERT_HEAD(&bmd->bmd_members, bmm, bmm_next);
++		sc->sc_mdbmembercnt++;
++	}
++	bmm->bmm_expire = lifetime == 0 ? 0 : time_uptime + lifetime;
++out:
++	BRIDGE_RT_UNLOCK(sc);
++
++	if (new_bmd != NULL)
++		free(new_bmd, M_DEVBUF);
++	if (new_bmm != NULL)
++		free(new_bmm, M_DEVBUF);
++
++	return (error);
++}
++
++static void
++bridge_mdb_flush_member(struct bridge_softc *sc, struct bridge_iflist *bif)
++{
++	struct bridge_mdb_entry *bmd, *nbmd;
++	struct bridge_mdb_member *bmm, *nbmm;
++
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	CK_LIST_FOREACH_SAFE(bmd, &sc->sc_mdb, bmd_next, nbmd) {
++		CK_LIST_FOREACH_SAFE(bmm, &bmd->bmd_members, bmm_next, nbmm) {
++			if (bmm->bmm_bif == bif &&
++			    bridge_mdb_remove_member(sc, bmd, bmm))
++				break;
++		}
++	}
++}
++
++static void
++bridge_mdb_prune(struct bridge_softc *sc)
++{
++	struct bridge_mdb_entry *bmd, *nbmd;
++	struct bridge_mdb_member *bmm, *nbmm;
++
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	CK_LIST_FOREACH_SAFE(bmd, &sc->sc_mdb, bmd_next, nbmd) {
++		CK_LIST_FOREACH_SAFE(bmm, &bmd->bmd_members, bmm_next, nbmm) {
++			if (bmm->bmm_expire != 0 &&
++			    time_uptime >= bmm->bmm_expire &&
++			    bridge_mdb_remove_member(sc, bmd, bmm))
++				break;
++		}
++	}
++}
++
++static void
++bridge_mdb_fini(struct bridge_softc *sc)
++{
++	struct bridge_mdb_entry *bmd;
++
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	while ((bmd = CK_LIST_FIRST(&sc->sc_mdb)) != NULL)
++		bridge_mdb_destroy_entry(sc, bmd);
++
++	KASSERT(sc->sc_mdbcnt == 0 && sc->sc_mdbmembercnt == 0,
++	    ("%s: MDB entries remain", __func__));
++}
++
+ static void
+ bridge_clone_destroy_cb(struct epoch_context *ctx)
+ {
+@@ -895,6 +1177,11 @@ bridge_clone_destroy(struct if_clone *ifc, struct ifnet *ifp, uint32_t flags)
+ 	NET_EPOCH_ENTER(et);
+ 
+ 	callout_drain(&sc->sc_brcallout);
++	callout_drain(&sc->sc_mdbcallout);
++
++	BRIDGE_RT_LOCK(sc);
++	bridge_mdb_fini(sc);
++	BRIDGE_RT_UNLOCK(sc);
+ 
+ 	BRIDGE_LIST_LOCK();
+ 	LIST_REMOVE(sc, sc_list);
+@@ -1222,6 +1509,7 @@ bridge_delete_member(struct bridge_softc *sc, struct bridge_iflist *bif,
+ 	bridge_linkcheck(sc);
+ 	bridge_mutecaps(sc);	/* recalcuate now this interface is removed */
+ 	BRIDGE_RT_LOCK(sc);
++	bridge_mdb_flush_member(sc, bif);
+ 	bridge_rtdelete(sc, ifs, IFBF_FLUSHALL);
+ 	BRIDGE_RT_UNLOCK(sc);
+ 	KASSERT(bif->bif_addrcnt == 0,
+@@ -2113,6 +2401,8 @@ bridge_init(void *xsc)
+ 	BRIDGE_LOCK(sc);
+ 	callout_reset(&sc->sc_brcallout, bridge_rtable_prune_period * hz,
+ 	    bridge_timer, sc);
++	callout_reset(&sc->sc_mdbcallout, BRIDGE_MDB_PRUNE_PERIOD * hz,
++	    bridge_mdb_timer, sc);
+ 
+ 	ifp->if_drv_flags |= IFF_DRV_RUNNING;
+ 	bstp_init(&sc->sc_stp);		/* Initialize Spanning Tree */
+@@ -2137,6 +2427,7 @@ bridge_stop(struct ifnet *ifp, int disable)
+ 
+ 	BRIDGE_RT_LOCK(sc);
+ 	callout_stop(&sc->sc_brcallout);
++	callout_stop(&sc->sc_mdbcallout);
+ 
+ 	bstp_stop(&sc->sc_stp);
+ 
+@@ -3139,6 +3430,27 @@ bridge_timer(void *arg)
+ 	CURVNET_RESTORE();
+ }
+ 
++/*
++ * bridge_mdb_timer:
++ *
++ *	Aging timer for the multicast database.
++ */
++static void
++bridge_mdb_timer(void *arg)
++{
++	struct bridge_softc *sc = arg;
++
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	CURVNET_SET(sc->sc_ifp->if_vnet);
++	bridge_mdb_prune(sc);
++
++	if (sc->sc_ifp->if_drv_flags & IFF_DRV_RUNNING)
++		callout_reset(&sc->sc_mdbcallout,
++		    BRIDGE_MDB_PRUNE_PERIOD * hz, bridge_mdb_timer, sc);
++	CURVNET_RESTORE();
++}
++
+ /*
+  * bridge_rtage:
+  *
+diff --git a/sys/net/if_bridgevar.h b/sys/net/if_bridgevar.h
+index 2fa9d8623..565400eb7 100644
+--- a/sys/net/if_bridgevar.h
++++ b/sys/net/if_bridgevar.h
+@@ -122,8 +122,8 @@
+ #define	BRDGSPROTO		28	/* set protocol (ifbrparam) */
+ #define	BRDGSTXHC		29	/* set tx hold count (ifbrparam) */
+ #define	BRDGSIFAMAX		30	/* set max interface addrs (ifbreq) */
+-#define	BRDGGFWDMASK		31	/* get group_fwd_mask (ifbrparam) */
+-#define	BRDGSFWDMASK		32	/* set group_fwd_mask (ifbrparam) */
++#define	BRDGGFWDMASK	31	/* get group_fwd_mask (ifbrparam) */
++#define	BRDGSFWDMASK	32	/* set group_fwd_mask (ifbrparam) */
+ 
+ /*
+  * Generic bridge control request.
+@@ -226,8 +226,7 @@ struct ifbrparam {
+ #define	ifbrp_csize	ifbrp_ifbrpu.ifbrpu_int32	/* cache size */
+ #define	ifbrp_ctime	ifbrp_ifbrpu.ifbrpu_int32	/* cache time (sec) */
+ #define	ifbrp_prio	ifbrp_ifbrpu.ifbrpu_int16	/* bridge priority */
+-#define	ifbrp_group_fwd_mask ifbrp_ifbrpu.ifbrpu_int16 /* reserved group
+-							 * fwd mask */
++#define	ifbrp_group_fwd_mask ifbrp_ifbrpu.ifbrpu_int16 /* reserved group fwd mask */
+ #define	ifbrp_proto	ifbrp_ifbrpu.ifbrpu_int8	/* bridge protocol */
+ #define	ifbrp_txhc	ifbrp_ifbrpu.ifbrpu_int8	/* bpdu tx holdcount */
+ #define	ifbrp_hellotime	ifbrp_ifbrpu.ifbrpu_int8	/* hello time (sec) */
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+index 99e5b41b6..6e693a646 100755
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -820,6 +820,58 @@ group_fwd_mask_cleanup()
+ 	vnet_cleanup
+ }
+ 
++bridge_mdb_vnet_topology_create()
++{
++	mdb_sender_epair=$(vnet_mkepair)
++	mdb_listener_epair=$(vnet_mkepair)
++	mdb_idle_epair=$(vnet_mkepair)
++
++	vnet_mkjail mdbs ${mdb_sender_epair}b
++	vnet_mkjail mdbl ${mdb_listener_epair}b
++	vnet_mkjail mdbi ${mdb_idle_epair}b
++
++	jexec mdbs ifconfig ${mdb_sender_epair}b 192.0.2.1/24 up
++	jexec mdbl ifconfig ${mdb_listener_epair}b 192.0.2.2/24 up
++	jexec mdbi ifconfig ${mdb_idle_epair}b 192.0.2.3/24 up
++
++	mdb_bridge=$(vnet_mkbridge)
++	ifconfig ${mdb_bridge} up
++
++	ifconfig ${mdb_sender_epair}a up
++	ifconfig ${mdb_listener_epair}a up
++	ifconfig ${mdb_idle_epair}a up
++	ifconfig ${mdb_bridge} addm ${mdb_sender_epair}a
++	ifconfig ${mdb_bridge} addm ${mdb_listener_epair}a
++	ifconfig ${mdb_bridge} addm ${mdb_idle_epair}a
++}
++
++atf_test_case "mdb_vnet_topology" "cleanup"
++mdb_vnet_topology_head()
++{
++	atf_set descr 'bridge multicast database VNET topology scaffold'
++	atf_set require.user root
++}
++
++mdb_vnet_topology_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge_mdb_vnet_topology_create
++
++	atf_check -s exit:0 -o inline:"3\n" \
++	    sh -c "ifconfig ${mdb_bridge} | grep member: | wc -l | xargs"
++	atf_check -s exit:0 -o ignore \
++	    jexec mdbs ping -c 1 -t 1 192.0.2.2
++	atf_check -s exit:0 -o ignore \
++	    jexec mdbs ping -c 1 -t 1 192.0.2.3
++}
++
++mdb_vnet_topology_cleanup()
++{
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -963,6 +1015,7 @@ atf_init_test_cases()
+ 	atf_add_test_case "vlan"
+ 	atf_add_test_case "many_bridge_members"
+ 	atf_add_test_case "group_fwd_mask"
++	atf_add_test_case "mdb_vnet_topology"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

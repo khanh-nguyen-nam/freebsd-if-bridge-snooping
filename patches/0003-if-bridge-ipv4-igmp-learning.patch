@@ -1,0 +1,284 @@
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+index e76b92969..65f08dd0f 100644
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -115,6 +115,9 @@
+ #include <netinet/in.h>
+ #include <netinet/in_systm.h>
+ #include <netinet/in_var.h>
++#ifdef INET
++#include <netinet/igmp.h>
++#endif
+ #include <netinet/ip.h>
+ #include <netinet/ip_var.h>
+ #ifdef INET6
+@@ -196,6 +199,14 @@
+ #define	BRIDGE_MDB_PRUNE_PERIOD		(5 * 60)
+ #endif
+ 
++/*
++ * Conservative IGMP listener lifetime used until querier tracking teaches the
++ * bridge protocol-derived intervals.
++ */
++#ifndef BRIDGE_MDB_IGMP_MAXAGE
++#define	BRIDGE_MDB_IGMP_MAXAGE		(2 * 125 + 10)
++#endif
++
+ /*
+  * List of capabilities to possibly mask on the member interface.
+  */
+@@ -397,6 +408,15 @@ static void	bridge_mdb_flush_member(struct bridge_softc *,
+ static int	bridge_mdb_add_member(struct bridge_softc *, sa_family_t,
+ 		    const void *, ether_vlanid_t, struct bridge_iflist *,
+ 		    unsigned int) __unused;
++#ifdef INET
++static void	bridge_mdb_input(struct bridge_softc *, struct bridge_iflist *,
++		    struct mbuf *);
++static int	bridge_mdb_learn_igmp(struct bridge_softc *,
++		    struct bridge_iflist *, struct mbuf *, int, ether_vlanid_t);
++static int	bridge_mdb_igmp_v3_report(struct bridge_softc *,
++		    struct bridge_iflist *, struct mbuf *, int, int,
++		    ether_vlanid_t);
++#endif
+ 
+ static int	bridge_rtnode_addr_cmp(const uint8_t *, const uint8_t *);
+ static struct bridge_rtnode *bridge_rtnode_lookup(struct bridge_softc *,
+@@ -1085,6 +1105,168 @@ bridge_mdb_add_member(struct bridge_softc *sc, sa_family_t family,
+ 	return (error);
+ }
+ 
++#ifdef INET
++static bool
++bridge_mdb_igmp_group_valid(struct in_addr group)
++{
++	return (IN_MULTICAST(ntohl(group.s_addr)));
++}
++
++static void
++bridge_mdb_input(struct bridge_softc *sc, struct bridge_iflist *bif,
++    struct mbuf *m)
++{
++	struct ether_header eh;
++	struct ether_vlan_header evh;
++	ether_vlanid_t vlan;
++	uint16_t ether_type;
++	int off;
++
++	if (m->m_pkthdr.len < ETHER_HDR_LEN)
++		return;
++
++	vlan = VLANTAGOF(m);
++	m_copydata(m, 0, sizeof(eh), (caddr_t)&eh);
++	ether_type = ntohs(eh.ether_type);
++	off = ETHER_HDR_LEN;
++
++	if (ether_type == ETHERTYPE_VLAN || ether_type == ETHERTYPE_QINQ) {
++		if (m->m_pkthdr.len < sizeof(evh))
++			return;
++		m_copydata(m, 0, sizeof(evh), (caddr_t)&evh);
++		if ((m->m_flags & M_VLANTAG) == 0)
++			vlan = EVL_VLANOFTAG(ntohs(evh.evl_tag));
++		ether_type = ntohs(evh.evl_proto);
++		off = sizeof(evh);
++	}
++
++	if (ether_type != ETHERTYPE_IP)
++		return;
++
++	(void)bridge_mdb_learn_igmp(sc, bif, m, off, vlan);
++}
++
++static int
++bridge_mdb_learn_igmp(struct bridge_softc *sc, struct bridge_iflist *bif,
++    struct mbuf *m, int ipoff, ether_vlanid_t vlan)
++{
++	struct igmp igmp;
++	struct ip ip;
++	int hlen, igmplen, igmpoff, iplen;
++
++	if (m->m_pkthdr.len < ipoff + sizeof(ip))
++		return (EINVAL);
++	m_copydata(m, ipoff, sizeof(ip), (caddr_t)&ip);
++
++	if (ip.ip_v != IPVERSION)
++		return (EINVAL);
++	hlen = ip.ip_hl << 2;
++	if (hlen < sizeof(ip))
++		return (EINVAL);
++	iplen = ntohs(ip.ip_len);
++	if (iplen < hlen + IGMP_MINLEN ||
++	    m->m_pkthdr.len < ipoff + iplen)
++		return (EINVAL);
++	if (ip.ip_p != IPPROTO_IGMP)
++		return (0);
++	if ((ip.ip_off & htons(IP_MF | IP_OFFMASK)) != 0)
++		return (EINVAL);
++	if (in_cksum_skip(m, ipoff + hlen, ipoff) != 0)
++		return (EINVAL);
++	if (ip.ip_ttl != 1)
++		return (EINVAL);
++
++	igmpoff = ipoff + hlen;
++	igmplen = iplen - hlen;
++	if (in_cksum_skip(m, igmpoff + igmplen, igmpoff) != 0)
++		return (EINVAL);
++
++	if (m->m_pkthdr.len < igmpoff + sizeof(igmp))
++		return (EINVAL);
++	m_copydata(m, igmpoff, sizeof(igmp), (caddr_t)&igmp);
++
++	switch (igmp.igmp_type) {
++	case IGMP_v1_HOST_MEMBERSHIP_REPORT:
++	case IGMP_v2_HOST_MEMBERSHIP_REPORT:
++		if (igmplen != IGMP_MINLEN ||
++		    !bridge_mdb_igmp_group_valid(igmp.igmp_group) ||
++		    !in_hosteq(igmp.igmp_group, ip.ip_dst))
++			return (EINVAL);
++		return (bridge_mdb_add_member(sc, AF_INET, &igmp.igmp_group,
++		    vlan, bif, BRIDGE_MDB_IGMP_MAXAGE));
++	case IGMP_HOST_LEAVE_MESSAGE:
++		if (igmplen != IGMP_MINLEN ||
++		    !bridge_mdb_igmp_group_valid(igmp.igmp_group))
++			return (EINVAL);
++		return (0);
++	case IGMP_v3_HOST_MEMBERSHIP_REPORT:
++		return (bridge_mdb_igmp_v3_report(sc, bif, m, igmpoff,
++		    igmplen, vlan));
++	default:
++		return (0);
++	}
++}
++
++static int
++bridge_mdb_igmp_v3_report(struct bridge_softc *sc, struct bridge_iflist *bif,
++    struct mbuf *m, int igmpoff, int igmplen, ether_vlanid_t vlan)
++{
++	struct igmp_grouprec rec;
++	struct igmp_report report;
++	int auxlen, end, i, nsrc, off, pass, reclen, remaining;
++	uint16_t nrecs;
++
++	if (igmplen < IGMP_V3_REPORT_MINLEN)
++		return (EINVAL);
++	m_copydata(m, igmpoff, sizeof(report), (caddr_t)&report);
++	if (report.ir_type != IGMP_v3_HOST_MEMBERSHIP_REPORT)
++		return (EINVAL);
++
++	end = igmpoff + igmplen;
++	nrecs = ntohs(report.ir_numgrps);
++	for (pass = 0; pass < 2; pass++) {
++		off = igmpoff + sizeof(report);
++		for (i = 0; i < nrecs; i++) {
++			if (end - off < IGMP_GRPREC_HDRLEN)
++				return (EINVAL);
++			m_copydata(m, off, sizeof(rec), (caddr_t)&rec);
++
++			nsrc = ntohs(rec.ig_numsrc);
++			auxlen = rec.ig_datalen * 4;
++			remaining = end - off - IGMP_GRPREC_HDRLEN;
++			if (nsrc > remaining / sizeof(struct in_addr))
++				return (EINVAL);
++			reclen = IGMP_GRPREC_HDRLEN +
++			    nsrc * sizeof(struct in_addr);
++			if (auxlen > end - off - reclen)
++				return (EINVAL);
++
++			if (pass == 1 &&
++			    bridge_mdb_igmp_group_valid(rec.ig_group)) {
++				switch (rec.ig_type) {
++				case IGMP_MODE_IS_EXCLUDE:
++				case IGMP_CHANGE_TO_EXCLUDE_MODE:
++					if (nsrc == 0)
++						(void)bridge_mdb_add_member(sc,
++						    AF_INET, &rec.ig_group,
++						    vlan, bif,
++						    BRIDGE_MDB_IGMP_MAXAGE);
++					break;
++				default:
++					break;
++				}
++			}
++
++			off += reclen + auxlen;
++		}
++		if (off != end)
++			return (EINVAL);
++	}
++
++	return (0);
++}
++#endif
++
+ static void
+ bridge_mdb_flush_member(struct bridge_softc *sc, struct bridge_iflist *bif)
+ {
+@@ -2808,6 +2990,9 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+ 		/* ...forward it to all interfaces. */
+ 		if_inc_counter(ifp, IFCOUNTER_IMCASTS, 1);
+ 		dst_if = NULL;
++#ifdef INET
++		bridge_mdb_input(sc, sbif, m);
++#endif
+ 	}
+ 
+ 	/*
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+index 6e693a646..4d478a5b6 100755
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -872,6 +872,47 @@ mdb_vnet_topology_cleanup()
+ 	vnet_cleanup
+ }
+ 
++atf_test_case "mdb_unknown_multicast_flood" "cleanup"
++mdb_unknown_multicast_flood_head()
++{
++	atf_set descr 'bridge MDB keeps unknown IPv4 multicast flood fallback'
++	atf_set require.user root
++	atf_set require.progs "tcpdump timeout"
++}
++
++mdb_unknown_multicast_flood_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge_mdb_vnet_topology_create
++
++	capture="${PWD}/mdb_unknown_multicast_flood.tcpdump"
++	rm -f "${capture}"
++
++	jexec mdbs route add -net 224.0.0.0/4 \
++	    -interface ${mdb_sender_epair}b >/dev/null 2>&1 || true
++	jexec mdbi sh -c "timeout 5 tcpdump --immediate-mode -n \
++	    -i ${mdb_idle_epair}b -c 1 \
++	    'icmp and dst host 239.1.1.1' > ${capture} 2>&1" &
++	tcpdumppid=$!
++	sleep 1
++
++	jexec mdbs ping -c 1 -t 1 239.1.1.1 >/dev/null 2>&1 || true
++	wait ${tcpdumppid}
++	status=$?
++
++	cat "${capture}"
++	if [ ${status} -ne 0 ]; then
++		atf_fail "unknown IPv4 multicast did not flood to idle port"
++	fi
++}
++
++mdb_unknown_multicast_flood_cleanup()
++{
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -1016,6 +1057,7 @@ atf_init_test_cases()
+ 	atf_add_test_case "many_bridge_members"
+ 	atf_add_test_case "group_fwd_mask"
+ 	atf_add_test_case "mdb_vnet_topology"
++	atf_add_test_case "mdb_unknown_multicast_flood"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

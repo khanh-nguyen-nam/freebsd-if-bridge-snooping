@@ -1,0 +1,391 @@
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+index 65f08dd0f..2fb98424a 100644
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -304,12 +304,14 @@ struct bridge_mdb_member {
+ 	CK_LIST_ENTRY(bridge_mdb_member) bmm_next;
+ 	struct bridge_iflist	*bmm_bif;
+ 	unsigned long		bmm_expire;
++	struct epoch_context	bmm_epoch_ctx;
+ };
+ 
+ struct bridge_mdb_entry {
+ 	CK_LIST_ENTRY(bridge_mdb_entry) bmd_next;
+ 	struct bridge_mdb_key	bmd_key;
+ 	CK_LIST_HEAD(, bridge_mdb_member) bmd_members;
++	struct epoch_context	bmd_epoch_ctx;
+ };
+ 
+ /*
+@@ -416,6 +418,8 @@ static int	bridge_mdb_learn_igmp(struct bridge_softc *,
+ static int	bridge_mdb_igmp_v3_report(struct bridge_softc *,
+ 		    struct bridge_iflist *, struct mbuf *, int, int,
+ 		    ether_vlanid_t);
++static bool	bridge_mdb_forward(struct bridge_softc *, struct bridge_iflist *,
++		    struct mbuf *);
+ #endif
+ 
+ static int	bridge_rtnode_addr_cmp(const uint8_t *, const uint8_t *);
+@@ -979,7 +983,7 @@ bridge_mdb_lookup(struct bridge_softc *sc, const struct bridge_mdb_key *key)
+ {
+ 	struct bridge_mdb_entry *bmd;
+ 
+-	BRIDGE_RT_LOCK_ASSERT(sc);
++	BRIDGE_RT_LOCK_OR_NET_EPOCH_ASSERT(sc);
+ 
+ 	CK_LIST_FOREACH(bmd, &sc->sc_mdb, bmd_next) {
+ 		if (bridge_mdb_key_equal(&bmd->bmd_key, key))
+@@ -1003,6 +1007,30 @@ bridge_mdb_member_lookup(struct bridge_mdb_entry *bmd,
+ 	return (NULL);
+ }
+ 
++/*
++ * MDB nodes are read by bridge_mdb_lookup()/bridge_mdb_forward() under the
++ * net epoch without holding BRIDGE_RT_LOCK.  Unlink them synchronously under
++ * the lock, but defer the free until the epoch ends so a concurrent reader
++ * cannot dereference freed memory.  This mirrors bridge_rtnode_destroy().
++ */
++static void
++bridge_mdb_destroy_member_cb(struct epoch_context *ctx)
++{
++	struct bridge_mdb_member *bmm;
++
++	bmm = __containerof(ctx, struct bridge_mdb_member, bmm_epoch_ctx);
++	free(bmm, M_DEVBUF);
++}
++
++static void
++bridge_mdb_destroy_entry_cb(struct epoch_context *ctx)
++{
++	struct bridge_mdb_entry *bmd;
++
++	bmd = __containerof(ctx, struct bridge_mdb_entry, bmd_epoch_ctx);
++	free(bmd, M_DEVBUF);
++}
++
+ static void
+ bridge_mdb_destroy_entry(struct bridge_softc *sc, struct bridge_mdb_entry *bmd)
+ {
+@@ -1013,12 +1041,12 @@ bridge_mdb_destroy_entry(struct bridge_softc *sc, struct bridge_mdb_entry *bmd)
+ 	while ((bmm = CK_LIST_FIRST(&bmd->bmd_members)) != NULL) {
+ 		CK_LIST_REMOVE(bmm, bmm_next);
+ 		sc->sc_mdbmembercnt--;
+-		free(bmm, M_DEVBUF);
++		NET_EPOCH_CALL(bridge_mdb_destroy_member_cb, &bmm->bmm_epoch_ctx);
+ 	}
+ 
+ 	CK_LIST_REMOVE(bmd, bmd_next);
+ 	sc->sc_mdbcnt--;
+-	free(bmd, M_DEVBUF);
++	NET_EPOCH_CALL(bridge_mdb_destroy_entry_cb, &bmd->bmd_epoch_ctx);
+ }
+ 
+ static bool
+@@ -1029,14 +1057,14 @@ bridge_mdb_remove_member(struct bridge_softc *sc, struct bridge_mdb_entry *bmd,
+ 
+ 	CK_LIST_REMOVE(bmm, bmm_next);
+ 	sc->sc_mdbmembercnt--;
+-	free(bmm, M_DEVBUF);
++	NET_EPOCH_CALL(bridge_mdb_destroy_member_cb, &bmm->bmm_epoch_ctx);
+ 
+ 	if (!CK_LIST_EMPTY(&bmd->bmd_members))
+ 		return (false);
+ 
+ 	CK_LIST_REMOVE(bmd, bmd_next);
+ 	sc->sc_mdbcnt--;
+-	free(bmd, M_DEVBUF);
++	NET_EPOCH_CALL(bridge_mdb_destroy_entry_cb, &bmd->bmd_epoch_ctx);
+ 	return (true);
+ }
+ 
+@@ -1265,6 +1293,173 @@ bridge_mdb_igmp_v3_report(struct bridge_softc *sc, struct bridge_iflist *bif,
+ 
+ 	return (0);
+ }
++
++/*
++ * bridge_mdb_forward:
++ *
++ *	Look up an IPv4 multicast destination in the MDB and forward only to
++ *	member interfaces that have a learned listener for the group.  Returns
++ *	true if the MDB handled the packet (caller must not flood); returns
++ *	false if the group is unknown and the caller should fall back to
++ *	flooding.  Consumes m on a true return.
++ */
++static bool
++bridge_mdb_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
++    struct mbuf *m)
++{
++	struct bridge_mdb_entry *bmd;
++	struct bridge_mdb_member *bmm, *last;
++	struct bridge_mdb_key key;
++	struct ether_header *eh;
++	struct ether_vlan_header evh;
++	struct ip ip;
++	struct ifnet *src_if, *dst_if;
++	ether_vlanid_t vlan;
++	uint16_t ether_type;
++	struct mbuf *mc;
++	int i, ipoff;
++	bool used;
++
++	NET_EPOCH_ASSERT();
++
++	if (m->m_pkthdr.len < ETHER_HDR_LEN)
++		return (false);
++
++	eh = mtod(m, struct ether_header *);
++
++	/* IPv4 multicast Ethernet addresses are 01:00:5e:xx:xx:xx. */
++	if (eh->ether_dhost[0] != 0x01 || eh->ether_dhost[1] != 0x00 ||
++	    eh->ether_dhost[2] != 0x5e)
++		return (false);
++
++	vlan = VLANTAGOF(m);
++	ether_type = ntohs(eh->ether_type);
++	ipoff = ETHER_HDR_LEN;
++
++	if (ether_type == ETHERTYPE_VLAN || ether_type == ETHERTYPE_QINQ) {
++		if (m->m_pkthdr.len < (int)sizeof(evh))
++			return (false);
++		m_copydata(m, 0, sizeof(evh), (caddr_t)&evh);
++		if ((m->m_flags & M_VLANTAG) == 0)
++			vlan = EVL_VLANOFTAG(ntohs(evh.evl_tag));
++		ether_type = ntohs(evh.evl_proto);
++		ipoff = sizeof(evh);
++	}
++
++	if (ether_type != ETHERTYPE_IP)
++		return (false);
++
++	if (m->m_pkthdr.len < ipoff + (int)sizeof(ip))
++		return (false);
++	m_copydata(m, ipoff, sizeof(ip), (caddr_t)&ip);
++
++	if (!IN_MULTICAST(ntohl(ip.ip_dst.s_addr)))
++		return (false);
++
++	if (bridge_mdb_key_init(&key, AF_INET, &ip.ip_dst, vlan) != 0)
++		return (false);
++
++	/*
++	 * Look up the MDB entry under epoch.  bridge_mdb_lookup accepts
++	 * either BRIDGE_RT_LOCK or an active net epoch for readers.
++	 */
++	bmd = bridge_mdb_lookup(sc, &key);
++	if (bmd == NULL)
++		return (false);
++
++	/*
++	 * Run the bridge-level output filter once before replicating.
++	 * Mirror the runfilt=1 path in bridge_broadcast.
++	 */
++	if (PFIL_HOOKED_OUT_46) {
++		if (bridge_pfil(&m, sc->sc_ifp, NULL, PFIL_OUT) != 0)
++			return (true);
++		if (m == NULL)
++			return (true);
++	}
++
++	src_if = m->m_pkthdr.rcvif;
++
++	/*
++	 * Walk the member list once to find the last eligible interface so
++	 * the original mbuf can be handed to it without an extra m_dup.
++	 */
++	last = NULL;
++	CK_LIST_FOREACH(bmm, &bmd->bmd_members, bmm_next) {
++		struct bridge_iflist *dbif = bmm->bmm_bif;
++
++		if (dbif->bif_ifp == src_if)
++			continue;
++		if (sbif != NULL &&
++		    (sbif->bif_flags & dbif->bif_flags & IFBIF_PRIVATE))
++			continue;
++		if ((dbif->bif_flags & IFBIF_STP) &&
++		    dbif->bif_stp.bp_state == BSTP_IFSTATE_DISCARDING)
++			continue;
++		if ((dbif->bif_ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
++			continue;
++		last = bmm;
++	}
++
++	if (last == NULL) {
++		/*
++		 * Group is known but every learned port is either the source
++		 * or ineligible.  Drop to suppress unneeded replication.
++		 */
++		m_freem(m);
++		return (true);
++	}
++
++	used = false;
++	CK_LIST_FOREACH(bmm, &bmd->bmd_members, bmm_next) {
++		struct bridge_iflist *dbif = bmm->bmm_bif;
++
++		dst_if = dbif->bif_ifp;
++		if (dst_if == src_if)
++			continue;
++		if (sbif != NULL &&
++		    (sbif->bif_flags & dbif->bif_flags & IFBIF_PRIVATE))
++			continue;
++		if ((dbif->bif_flags & IFBIF_STP) &&
++		    dbif->bif_stp.bp_state == BSTP_IFSTATE_DISCARDING)
++			continue;
++		if ((dst_if->if_drv_flags & IFF_DRV_RUNNING) == 0)
++			continue;
++
++		if (bmm == last) {
++			mc = m;
++			used = true;
++		} else {
++			mc = m_dup(m, M_NOWAIT);
++			if (mc == NULL) {
++				if_inc_counter(sc->sc_ifp, IFCOUNTER_OERRORS, 1);
++				continue;
++			}
++		}
++
++		if (PFIL_HOOKED_OUT_46) {
++			if (!used) {
++				i = min(mc->m_pkthdr.len, max_protohdr);
++				mc = m_copyup(mc, i, ETHER_ALIGN);
++				if (mc == NULL) {
++					if_inc_counter(sc->sc_ifp,
++					    IFCOUNTER_OERRORS, 1);
++					continue;
++				}
++			}
++			if (bridge_pfil(&mc, NULL, dst_if, PFIL_OUT) != 0)
++				continue;
++			if (mc == NULL)
++				continue;
++		}
++
++		bridge_enqueue(sc, dst_if, mc);
++	}
++	if (!used)
++		m_freem(m);
++
++	return (true);
++}
+ #endif
+ 
+ static void
+@@ -3016,6 +3211,10 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+ 	}
+ 
+ 	if (dst_if == NULL) {
++#ifdef INET
++		if (bridge_mdb_forward(sc, sbif, m))
++			return;
++#endif
+ 		bridge_broadcast(sc, src_if, m, 1);
+ 		return;
+ 	}
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+index 4d478a5b6..157b967ec 100755
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -913,6 +913,93 @@ mdb_unknown_multicast_flood_cleanup()
+ 	vnet_cleanup
+ }
+ 
++atf_test_case "mdb_selective_forward" "cleanup"
++mdb_selective_forward_head()
++{
++	atf_set descr 'bridge MDB prunes learned IPv4 multicast from idle ports'
++	atf_set require.user root
++	atf_set require.progs "cc tcpdump timeout"
++}
++
++mdb_selective_forward_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge_mdb_vnet_topology_create
++
++	# Compile a small helper that joins a multicast group and holds the
++	# socket open.  VNET jails share the host filesystem, so a binary
++	# written to /tmp on the host is reachable via jexec without copying.
++	cat > /tmp/mcast_join_bridge_test.c << 'CSRC'
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <string.h>
++#include <stdlib.h>
++#include <unistd.h>
++int main(int argc, char **argv)
++{
++	struct ip_mreq mreq;
++	int s, on = 1, secs;
++	if (argc != 4) return 1;
++	secs = atoi(argv[3]);
++	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	if (s < 0) return 1;
++	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++	memset(&mreq, 0, sizeof(mreq));
++	mreq.imr_multiaddr.s_addr = inet_addr(argv[1]);
++	mreq.imr_interface.s_addr = inet_addr(argv[2]);
++	if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
++	    &mreq, sizeof(mreq)) < 0)
++		return 1;
++	sleep(secs);
++	return 0;
++}
++CSRC
++	cc -o /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c || \
++	    atf_skip "could not compile mcast_join helper"
++
++	# Join 239.1.1.1 from the listener jail.  The kernel sends an IGMP
++	# membership report which the bridge learns via bridge_mdb_input().
++	jexec mdbl /tmp/mcast_join_bridge_test 239.1.1.1 192.0.2.2 30 &
++	joiner_pid=$!
++	# Allow time for the IGMP report to traverse the bridge and be learned.
++	sleep 2
++
++	jexec mdbs route add -net 224.0.0.0/4 \
++	    -interface ${mdb_sender_epair}b >/dev/null 2>&1 || true
++
++	# Arm tcpdump on the idle port.  If the MDB is working, no multicast
++	# for 239.1.1.1 should arrive on the idle port.
++	capture="${PWD}/mdb_selective_forward.tcpdump"
++	rm -f "${capture}"
++	jexec mdbi sh -c "timeout 4 tcpdump --immediate-mode -n \
++	    -i ${mdb_idle_epair}b -c 1 \
++	    'icmp and dst host 239.1.1.1' > ${capture} 2>&1" &
++	tcpdump_pid=$!
++	sleep 1
++
++	jexec mdbs ping -c 1 -t 1 239.1.1.1 >/dev/null 2>&1 || true
++	wait ${tcpdump_pid}
++	idle_status=$?
++
++	kill ${joiner_pid} 2>/dev/null || true
++
++	# idle_status 0 means tcpdump captured a packet on the idle port,
++	# which means MDB-based pruning is not working.
++	if [ ${idle_status} -eq 0 ]; then
++		cat "${capture}"
++		atf_fail "idle port received multicast that MDB should have pruned"
++	fi
++}
++
++mdb_selective_forward_cleanup()
++{
++	rm -f /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -1058,6 +1145,7 @@ atf_init_test_cases()
+ 	atf_add_test_case "group_fwd_mask"
+ 	atf_add_test_case "mdb_vnet_topology"
+ 	atf_add_test_case "mdb_unknown_multicast_flood"
++	atf_add_test_case "mdb_selective_forward"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

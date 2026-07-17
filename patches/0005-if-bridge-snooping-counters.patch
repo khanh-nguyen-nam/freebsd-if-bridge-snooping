@@ -1,0 +1,405 @@
+diff --git a/share/man/man4/bridge.4 b/share/man/man4/bridge.4
+index 7e44c3773..f0ee4c894 100644
+--- a/share/man/man4/bridge.4
++++ b/share/man/man4/bridge.4
+@@ -455,6 +455,48 @@ interface and not to the bridge members.
+ Enabling
+ .Va net.link.bridge.pfil_local_phys
+ will let you do the additional filtering on the physical interface.
++.Sh IGMP SNOOPING
++The
++.Nm
++driver can observe IPv4 IGMP membership reports to learn which member
++ports have listeners for a given multicast group and prune multicast
++forwarding to only those ports.
++This is disabled by default; forwarding falls back to flooding whenever no
++listener state is known, for non-IP multicast, and for exempt link-local
++control traffic.
++The following
++.Xr sysctl 8
++variables control and observe this behavior:
++.Bl -tag -width indent
++.It Va net.link.bridge.igmp_snooping
++Set to
++.Li 1
++to enable IGMP snooping so that IPv4 multicast with known listener state is
++pruned to the interested member ports.
++Set to
++.Li 0
++(the default) to disable learning and forwarding-path pruning; all multicast
++is flooded as it was before snooping existed.
++This variable is per-VNET and may be set as a tunable.
++.It Va net.link.bridge.mdb_entries
++Read-only count of multicast group entries currently held in the multicast
++database (MDB).
++.It Va net.link.bridge.mdb_prune_hits
++Read-only count of IPv4 multicast frames that were forwarded to a pruned set
++of MDB listeners rather than flooded.
++.It Va net.link.bridge.mdb_flood_fallback
++Read-only count of IPv4 multicast frames that were flooded because no MDB
++listener state existed for the group.
++.It Va net.link.bridge.mdb_parse_reject
++Read-only count of malformed or unsupported IGMP control packets rejected by
++the snooping parser.
++.It Va net.link.bridge.mdb_expired
++Read-only count of MDB listener entries removed because their membership aged
++out.
++.El
++.Pp
++Writing any value to one of the read-only counters resets it to zero.
++The counters are per-VNET.
+ .Sh NETMAP
+ .Xr netmap 4
+ applications may open a bridge interface in emulated mode.
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+index 2fb98424a..29d6e9921 100644
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -90,6 +90,7 @@
+ #include <sys/time.h>
+ #include <sys/socket.h> /* for net/if.h */
+ #include <sys/sockio.h>
++#include <sys/counter.h>
+ #include <sys/ctype.h>  /* string functions */
+ #include <sys/kernel.h>
+ #include <sys/random.h>
+@@ -585,6 +586,53 @@ bridge_member_ifaddrs(void)
+ 	return (V_member_ifaddrs);
+ }
+ 
++/*
++ * IGMP snooping runtime enable.  Default off: when disabled the bridge does
++ * not learn listener state and floods all multicast exactly as it did before
++ * the MDB was introduced.
++ */
++VNET_DEFINE_STATIC(int, igmp_snooping) = 0;
++#define	V_igmp_snooping	VNET(igmp_snooping)
++SYSCTL_INT(_net_link_bridge, OID_AUTO, igmp_snooping,
++    CTLFLAG_RWTUN | CTLFLAG_VNET, &VNET_NAME(igmp_snooping), 0,
++    "Enable IGMP snooping: prune IPv4 multicast to learned listener ports");
++
++/*
++ * Observability counters for the MDB / snooping path.  These let reviewers
++ * inspect learned state and fallback behavior without relying only on
++ * packet captures.  Writing any value to a counter zeroes it (stock
++ * sysctl_handle_counter_u64() behavior), so they must be CTLFLAG_RW.
++ */
++VNET_DEFINE_STATIC(counter_u64_t, mdb_entries);
++#define	V_mdb_entries	VNET(mdb_entries)
++SYSCTL_COUNTER_U64(_net_link_bridge, OID_AUTO, mdb_entries,
++    CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(mdb_entries),
++    "Current number of multicast group entries in the bridge MDB");
++
++VNET_DEFINE_STATIC(counter_u64_t, mdb_prune_hits);
++#define	V_mdb_prune_hits	VNET(mdb_prune_hits)
++SYSCTL_COUNTER_U64(_net_link_bridge, OID_AUTO, mdb_prune_hits,
++    CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(mdb_prune_hits),
++    "IPv4 multicast frames forwarded to a pruned set of MDB listeners");
++
++VNET_DEFINE_STATIC(counter_u64_t, mdb_flood_fallback);
++#define	V_mdb_flood_fallback	VNET(mdb_flood_fallback)
++SYSCTL_COUNTER_U64(_net_link_bridge, OID_AUTO, mdb_flood_fallback,
++    CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(mdb_flood_fallback),
++    "IPv4 multicast frames flooded because no MDB listener state existed");
++
++VNET_DEFINE_STATIC(counter_u64_t, mdb_parse_reject);
++#define	V_mdb_parse_reject	VNET(mdb_parse_reject)
++SYSCTL_COUNTER_U64(_net_link_bridge, OID_AUTO, mdb_parse_reject,
++    CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(mdb_parse_reject),
++    "Malformed or unsupported IGMP control packets rejected by snooping");
++
++VNET_DEFINE_STATIC(counter_u64_t, mdb_expired);
++#define	V_mdb_expired	VNET(mdb_expired)
++SYSCTL_COUNTER_U64(_net_link_bridge, OID_AUTO, mdb_expired,
++    CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(mdb_expired),
++    "MDB listener entries removed due to membership aging");
++
+ VNET_DEFINE_STATIC(int, log_interval) = 5;
+ VNET_DEFINE_STATIC(int, log_count) = 0;
+ VNET_DEFINE_STATIC(struct timeval, log_last) = { 0 };
+@@ -719,6 +766,12 @@ vnet_bridge_init(const void *unused __unused)
+ 	    UMA_ALIGN_PTR, 0);
+ 	BRIDGE_LIST_LOCK_INIT();
+ 
++	V_mdb_entries = counter_u64_alloc(M_WAITOK);
++	V_mdb_prune_hits = counter_u64_alloc(M_WAITOK);
++	V_mdb_flood_fallback = counter_u64_alloc(M_WAITOK);
++	V_mdb_parse_reject = counter_u64_alloc(M_WAITOK);
++	V_mdb_expired = counter_u64_alloc(M_WAITOK);
++
+ 	struct if_clone_addreq req = {
+ 		.create_f = bridge_clone_create,
+ 		.destroy_f = bridge_clone_destroy,
+@@ -741,6 +794,12 @@ vnet_bridge_uninit(const void *unused __unused)
+ 	NET_EPOCH_DRAIN_CALLBACKS();
+ 
+ 	uma_zdestroy(V_bridge_rtnode_zone);
++
++	counter_u64_free(V_mdb_entries);
++	counter_u64_free(V_mdb_prune_hits);
++	counter_u64_free(V_mdb_flood_fallback);
++	counter_u64_free(V_mdb_parse_reject);
++	counter_u64_free(V_mdb_expired);
+ }
+ VNET_SYSUNINIT(vnet_bridge_uninit, SI_SUB_PSEUDO, SI_ORDER_ANY,
+     vnet_bridge_uninit, NULL);
+@@ -1046,6 +1105,7 @@ bridge_mdb_destroy_entry(struct bridge_softc *sc, struct bridge_mdb_entry *bmd)
+ 
+ 	CK_LIST_REMOVE(bmd, bmd_next);
+ 	sc->sc_mdbcnt--;
++	counter_u64_add(V_mdb_entries, -1);
+ 	NET_EPOCH_CALL(bridge_mdb_destroy_entry_cb, &bmd->bmd_epoch_ctx);
+ }
+ 
+@@ -1064,6 +1124,7 @@ bridge_mdb_remove_member(struct bridge_softc *sc, struct bridge_mdb_entry *bmd,
+ 
+ 	CK_LIST_REMOVE(bmd, bmd_next);
+ 	sc->sc_mdbcnt--;
++	counter_u64_add(V_mdb_entries, -1);
+ 	NET_EPOCH_CALL(bridge_mdb_destroy_entry_cb, &bmd->bmd_epoch_ctx);
+ 	return (true);
+ }
+@@ -1105,6 +1166,7 @@ bridge_mdb_add_member(struct bridge_softc *sc, sa_family_t family,
+ 		new_bmd = NULL;
+ 		CK_LIST_INSERT_HEAD(&sc->sc_mdb, bmd, bmd_next);
+ 		sc->sc_mdbcnt++;
++		counter_u64_add(V_mdb_entries, 1);
+ 		created_bmd = true;
+ 	}
+ 
+@@ -1171,7 +1233,8 @@ bridge_mdb_input(struct bridge_softc *sc, struct bridge_iflist *bif,
+ 	if (ether_type != ETHERTYPE_IP)
+ 		return;
+ 
+-	(void)bridge_mdb_learn_igmp(sc, bif, m, off, vlan);
++	if (bridge_mdb_learn_igmp(sc, bif, m, off, vlan) == EINVAL)
++		counter_u64_add(V_mdb_parse_reject, 1);
+ }
+ 
+ static int
+@@ -1364,8 +1427,14 @@ bridge_mdb_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+ 	 * either BRIDGE_RT_LOCK or an active net epoch for readers.
+ 	 */
+ 	bmd = bridge_mdb_lookup(sc, &key);
+-	if (bmd == NULL)
++	if (bmd == NULL) {
++		/* Known IPv4 multicast, but no listener state: flood. */
++		counter_u64_add(V_mdb_flood_fallback, 1);
+ 		return (false);
++	}
++
++	/* Positive listener state: the MDB will prune this frame. */
++	counter_u64_add(V_mdb_prune_hits, 1);
+ 
+ 	/*
+ 	 * Run the bridge-level output filter once before replicating.
+@@ -1489,9 +1558,11 @@ bridge_mdb_prune(struct bridge_softc *sc)
+ 
+ 	CK_LIST_FOREACH_SAFE(bmd, &sc->sc_mdb, bmd_next, nbmd) {
+ 		CK_LIST_FOREACH_SAFE(bmm, &bmd->bmd_members, bmm_next, nbmm) {
+-			if (bmm->bmm_expire != 0 &&
+-			    time_uptime >= bmm->bmm_expire &&
+-			    bridge_mdb_remove_member(sc, bmd, bmm))
++			if (bmm->bmm_expire == 0 ||
++			    time_uptime < bmm->bmm_expire)
++				continue;
++			counter_u64_add(V_mdb_expired, 1);
++			if (bridge_mdb_remove_member(sc, bmd, bmm))
+ 				break;
+ 		}
+ 	}
+@@ -3186,7 +3257,8 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+ 		if_inc_counter(ifp, IFCOUNTER_IMCASTS, 1);
+ 		dst_if = NULL;
+ #ifdef INET
+-		bridge_mdb_input(sc, sbif, m);
++		if (V_igmp_snooping)
++			bridge_mdb_input(sc, sbif, m);
+ #endif
+ 	}
+ 
+@@ -3212,7 +3284,7 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+ 
+ 	if (dst_if == NULL) {
+ #ifdef INET
+-		if (bridge_mdb_forward(sc, sbif, m))
++		if (V_igmp_snooping && bridge_mdb_forward(sc, sbif, m))
+ 			return;
+ #endif
+ 		bridge_broadcast(sc, src_if, m, 1);
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+index 157b967ec..b65334ff5 100755
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -845,6 +845,41 @@ bridge_mdb_vnet_topology_create()
+ 	ifconfig ${mdb_bridge} addm ${mdb_idle_epair}a
+ }
+ 
++# Compile a small helper that joins a multicast group and holds the socket
++# open.  VNET jails share the host filesystem, so a binary written to /tmp on
++# the host is reachable via jexec without copying.
++bridge_mdb_compile_join_helper()
++{
++	cat > /tmp/mcast_join_bridge_test.c << 'CSRC'
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <string.h>
++#include <stdlib.h>
++#include <unistd.h>
++int main(int argc, char **argv)
++{
++	struct ip_mreq mreq;
++	int s, on = 1, secs;
++	if (argc != 4) return 1;
++	secs = atoi(argv[3]);
++	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	if (s < 0) return 1;
++	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++	memset(&mreq, 0, sizeof(mreq));
++	mreq.imr_multiaddr.s_addr = inet_addr(argv[1]);
++	mreq.imr_interface.s_addr = inet_addr(argv[2]);
++	if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
++	    &mreq, sizeof(mreq)) < 0)
++		return 1;
++	sleep(secs);
++	return 0;
++}
++CSRC
++	cc -o /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c || \
++	    atf_skip "could not compile mcast_join helper"
++}
++
+ atf_test_case "mdb_vnet_topology" "cleanup"
+ mdb_vnet_topology_head()
+ {
+@@ -887,6 +922,12 @@ mdb_unknown_multicast_flood_body()
+ 
+ 	bridge_mdb_vnet_topology_create
+ 
++	# Enable snooping so this exercises the real flood-fallback path
++	# (snooping on, but no learned listener state for the group) rather
++	# than the trivially-flooding disabled path.
++	atf_check -s exit:0 -o ignore \
++	    sysctl net.link.bridge.igmp_snooping=1
++
+ 	capture="${PWD}/mdb_unknown_multicast_flood.tcpdump"
+ 	rm -f "${capture}"
+ 
+@@ -928,37 +969,12 @@ mdb_selective_forward_body()
+ 
+ 	bridge_mdb_vnet_topology_create
+ 
+-	# Compile a small helper that joins a multicast group and holds the
+-	# socket open.  VNET jails share the host filesystem, so a binary
+-	# written to /tmp on the host is reachable via jexec without copying.
+-	cat > /tmp/mcast_join_bridge_test.c << 'CSRC'
+-#include <sys/socket.h>
+-#include <netinet/in.h>
+-#include <arpa/inet.h>
+-#include <string.h>
+-#include <stdlib.h>
+-#include <unistd.h>
+-int main(int argc, char **argv)
+-{
+-	struct ip_mreq mreq;
+-	int s, on = 1, secs;
+-	if (argc != 4) return 1;
+-	secs = atoi(argv[3]);
+-	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+-	if (s < 0) return 1;
+-	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+-	memset(&mreq, 0, sizeof(mreq));
+-	mreq.imr_multiaddr.s_addr = inet_addr(argv[1]);
+-	mreq.imr_interface.s_addr = inet_addr(argv[2]);
+-	if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+-	    &mreq, sizeof(mreq)) < 0)
+-		return 1;
+-	sleep(secs);
+-	return 0;
+-}
+-CSRC
+-	cc -o /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c || \
+-	    atf_skip "could not compile mcast_join helper"
++	# Snooping is off by default; enable it so the MDB learns listener
++	# state and the forwarding path prunes to interested ports.
++	atf_check -s exit:0 -o ignore \
++	    sysctl net.link.bridge.igmp_snooping=1
++
++	bridge_mdb_compile_join_helper
+ 
+ 	# Join 239.1.1.1 from the listener jail.  The kernel sends an IGMP
+ 	# membership report which the bridge learns via bridge_mdb_input().
+@@ -1000,6 +1016,64 @@ mdb_selective_forward_cleanup()
+ 	vnet_cleanup
+ }
+ 
++atf_test_case "mdb_counters" "cleanup"
++mdb_counters_head()
++{
++	atf_set descr 'bridge MDB observability counters track entries/prune/flood'
++	atf_set require.user root
++	atf_set require.progs "cc"
++}
++
++mdb_counters_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge_mdb_vnet_topology_create
++
++	# Snooping is off by default; enable it so the MDB learns and prunes.
++	atf_check -s exit:0 -o ignore \
++	    sysctl net.link.bridge.igmp_snooping=1
++
++	# A fresh VNET starts with zeroed counters, but reset the event
++	# counters explicitly so the assertions below are independent of any
++	# earlier control traffic on the bridge.
++	atf_check -s exit:0 -o ignore sysctl net.link.bridge.mdb_prune_hits=0
++	atf_check -s exit:0 -o ignore sysctl net.link.bridge.mdb_flood_fallback=0
++
++	bridge_mdb_compile_join_helper
++
++	# Join 239.1.1.1 so the MDB learns exactly one group entry.
++	jexec mdbl /tmp/mcast_join_bridge_test 239.1.1.1 192.0.2.2 30 &
++	joiner_pid=$!
++	sleep 2
++
++	# The learned group must show up in the entry gauge.
++	atf_check -o match:'^[1-9][0-9]*$' \
++	    sysctl -n net.link.bridge.mdb_entries
++
++	jexec mdbs route add -net 224.0.0.0/4 \
++	    -interface ${mdb_sender_epair}b >/dev/null 2>&1 || true
++
++	# Traffic to the joined group is pruned to the listener (prune hit).
++	jexec mdbs ping -c 2 -t 1 239.1.1.1 >/dev/null 2>&1 || true
++	# Traffic to an unjoined group has no listener state and floods.
++	jexec mdbs ping -c 2 -t 1 239.9.9.9 >/dev/null 2>&1 || true
++
++	kill ${joiner_pid} 2>/dev/null || true
++
++	atf_check -o match:'^[1-9][0-9]*$' \
++	    sysctl -n net.link.bridge.mdb_prune_hits
++	atf_check -o match:'^[1-9][0-9]*$' \
++	    sysctl -n net.link.bridge.mdb_flood_fallback
++}
++
++mdb_counters_cleanup()
++{
++	rm -f /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -1146,6 +1220,7 @@ atf_init_test_cases()
+ 	atf_add_test_case "mdb_vnet_topology"
+ 	atf_add_test_case "mdb_unknown_multicast_flood"
+ 	atf_add_test_case "mdb_selective_forward"
++	atf_add_test_case "mdb_counters"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

@@ -1,0 +1,744 @@
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -206,6 +206,16 @@
+  */
+ #ifndef BRIDGE_MDB_IGMP_MAXAGE
+ #define	BRIDGE_MDB_IGMP_MAXAGE		(2 * 125 + 10)
++#endif
++
++/*
++ * Conservative router-port lifetime.  A member port is treated as leading to a
++ * multicast router for as long as IGMP membership queries keep arriving on it.
++ * This matches the standard "other querier present" interval
++ * (robustness * query-interval + max-response) and is refreshed by each query.
++ */
++#ifndef BRIDGE_MDB_ROUTER_MAXAGE
++#define	BRIDGE_MDB_ROUTER_MAXAGE	(2 * 125 + 5)
+ #endif
+ 
+ /*
+@@ -313,6 +323,22 @@
+ 	struct bridge_mdb_key	bmd_key;
+ 	CK_LIST_HEAD(, bridge_mdb_member) bmd_members;
+ 	struct epoch_context	bmd_epoch_ctx;
++};
++
++/*
++ * Bridge multicast router entry.  Records a member interface on which IGMP
++ * membership queries have been seen, i.e. a port that leads to a multicast
++ * router.  Router ports receive all snooped multicast for their VLAN in
++ * addition to the learned listener ports, so that pruning does not blackhole
++ * traffic a router needs to relay.  Entries are keyed by (VLAN, port) and
++ * aged like listener membership.
++ */
++struct bridge_mdb_router {
++	CK_LIST_ENTRY(bridge_mdb_router) bmr_next;
++	struct bridge_iflist	*bmr_bif;
++	ether_vlanid_t		bmr_vlan;
++	unsigned long		bmr_expire;
++	struct epoch_context	bmr_epoch_ctx;
+ };
+ 
+ /*
+@@ -335,6 +361,8 @@
+ 	CK_LIST_HEAD(, bridge_mdb_entry) sc_mdb;	/* multicast database */
+ 	uint32_t		sc_mdbcnt;	/* # of multicast groups */
+ 	uint32_t		sc_mdbmembercnt; /* # of multicast members */
++	CK_LIST_HEAD(, bridge_mdb_router) sc_mdbrouters; /* multicast routers */
++	uint32_t		sc_mdbroutercnt; /* # of router ports */
+ 	uint32_t		sc_rthash_key;	/* key for hash */
+ 	CK_LIST_HEAD(, bridge_iflist) sc_spanlist;	/* span ports list */
+ 	struct bstp_state	sc_stp;		/* STP state */
+@@ -411,6 +439,12 @@
+ static int	bridge_mdb_add_member(struct bridge_softc *, sa_family_t,
+ 		    const void *, ether_vlanid_t, struct bridge_iflist *,
+ 		    unsigned int) __unused;
++static int	bridge_mdb_add_router(struct bridge_softc *, ether_vlanid_t,
++		    struct bridge_iflist *, unsigned int) __unused;
++static void	bridge_mdb_remove_router(struct bridge_softc *,
++		    struct bridge_mdb_router *);
++static void	bridge_mdb_flush_router(struct bridge_softc *,
++		    struct bridge_iflist *);
+ #ifdef INET
+ static void	bridge_mdb_input(struct bridge_softc *, struct bridge_iflist *,
+ 		    struct mbuf *);
+@@ -633,6 +667,12 @@
+     CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(mdb_expired),
+     "MDB listener entries removed due to membership aging");
+ 
++VNET_DEFINE_STATIC(counter_u64_t, mdb_routers);
++#define	V_mdb_routers	VNET(mdb_routers)
++SYSCTL_COUNTER_U64(_net_link_bridge, OID_AUTO, mdb_routers,
++    CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(mdb_routers),
++    "Current number of multicast router ports learned from IGMP queries");
++
+ VNET_DEFINE_STATIC(int, log_interval) = 5;
+ VNET_DEFINE_STATIC(int, log_count) = 0;
+ VNET_DEFINE_STATIC(struct timeval, log_last) = { 0 };
+@@ -772,6 +812,7 @@
+ 	V_mdb_flood_fallback = counter_u64_alloc(M_WAITOK);
+ 	V_mdb_parse_reject = counter_u64_alloc(M_WAITOK);
+ 	V_mdb_expired = counter_u64_alloc(M_WAITOK);
++	V_mdb_routers = counter_u64_alloc(M_WAITOK);
+ 
+ 	struct if_clone_addreq req = {
+ 		.create_f = bridge_clone_create,
+@@ -801,6 +842,7 @@
+ 	counter_u64_free(V_mdb_flood_fallback);
+ 	counter_u64_free(V_mdb_parse_reject);
+ 	counter_u64_free(V_mdb_expired);
++	counter_u64_free(V_mdb_routers);
+ }
+ VNET_SYSUNINIT(vnet_bridge_uninit, SI_SUB_PSEUDO, SI_ORDER_ANY,
+     vnet_bridge_uninit, NULL);
+@@ -989,6 +1031,8 @@
+ 	CK_LIST_INIT(&sc->sc_mdb);
+ 	sc->sc_mdbcnt = 0;
+ 	sc->sc_mdbmembercnt = 0;
++	CK_LIST_INIT(&sc->sc_mdbrouters);
++	sc->sc_mdbroutercnt = 0;
+ }
+ 
+ static int
+@@ -1067,6 +1111,22 @@
+ 	return (NULL);
+ }
+ 
++static struct bridge_mdb_router *
++bridge_mdb_router_lookup(struct bridge_softc *sc, ether_vlanid_t vlan,
++    struct bridge_iflist *bif)
++{
++	struct bridge_mdb_router *bmr;
++
++	BRIDGE_RT_LOCK_OR_NET_EPOCH_ASSERT(sc);
++
++	CK_LIST_FOREACH(bmr, &sc->sc_mdbrouters, bmr_next) {
++		if (bmr->bmr_bif == bif && bmr->bmr_vlan == vlan)
++			return (bmr);
++	}
++
++	return (NULL);
++}
++
+ /*
+  * MDB nodes are read by bridge_mdb_lookup()/bridge_mdb_forward() under the
+  * net epoch without holding BRIDGE_RT_LOCK.  Unlink them synchronously under
+@@ -1092,6 +1152,26 @@
+ }
+ 
+ static void
++bridge_mdb_destroy_router_cb(struct epoch_context *ctx)
++{
++	struct bridge_mdb_router *bmr;
++
++	bmr = __containerof(ctx, struct bridge_mdb_router, bmr_epoch_ctx);
++	free(bmr, M_DEVBUF);
++}
++
++static void
++bridge_mdb_remove_router(struct bridge_softc *sc, struct bridge_mdb_router *bmr)
++{
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	CK_LIST_REMOVE(bmr, bmr_next);
++	sc->sc_mdbroutercnt--;
++	counter_u64_add(V_mdb_routers, -1);
++	NET_EPOCH_CALL(bridge_mdb_destroy_router_cb, &bmr->bmr_epoch_ctx);
++}
++
++static void
+ bridge_mdb_destroy_entry(struct bridge_softc *sc, struct bridge_mdb_entry *bmd)
+ {
+ 	struct bridge_mdb_member *bmm;
+@@ -1194,6 +1274,45 @@
+ 		free(new_bmm, M_DEVBUF);
+ 
+ 	return (error);
++}
++
++/*
++ * Record that member interface bif leads to a multicast router on the given
++ * VLAN, or refresh the expiry of an existing router entry.  Called for each
++ * IGMP membership query seen on a port.
++ */
++static int
++bridge_mdb_add_router(struct bridge_softc *sc, ether_vlanid_t vlan,
++    struct bridge_iflist *bif, unsigned int lifetime)
++{
++	struct bridge_mdb_router *bmr, *new_bmr;
++
++	new_bmr = malloc(sizeof(*new_bmr), M_DEVBUF, M_NOWAIT | M_ZERO);
++	if (new_bmr != NULL) {
++		new_bmr->bmr_bif = bif;
++		new_bmr->bmr_vlan = vlan;
++	}
++
++	BRIDGE_RT_LOCK(sc);
++	bmr = bridge_mdb_router_lookup(sc, vlan, bif);
++	if (bmr == NULL) {
++		if (new_bmr == NULL) {
++			BRIDGE_RT_UNLOCK(sc);
++			return (ENOMEM);
++		}
++		bmr = new_bmr;
++		new_bmr = NULL;
++		CK_LIST_INSERT_HEAD(&sc->sc_mdbrouters, bmr, bmr_next);
++		sc->sc_mdbroutercnt++;
++		counter_u64_add(V_mdb_routers, 1);
++	}
++	bmr->bmr_expire = lifetime == 0 ? 0 : time_uptime + lifetime;
++	BRIDGE_RT_UNLOCK(sc);
++
++	if (new_bmr != NULL)
++		free(new_bmr, M_DEVBUF);
++
++	return (0);
+ }
+ 
+ #ifdef INET
+@@ -1278,6 +1397,15 @@
+ 	m_copydata(m, igmpoff, sizeof(igmp), (caddr_t)&igmp);
+ 
+ 	switch (igmp.igmp_type) {
++	case IGMP_HOST_MEMBERSHIP_QUERY:
++		/*
++		 * A membership query means a multicast router (querier) is
++		 * reachable through this port.  Record it as a router port so
++		 * snooped multicast is also delivered there; a query is not a
++		 * group join, so no listener state is created.
++		 */
++		return (bridge_mdb_add_router(sc, vlan, bif,
++		    BRIDGE_MDB_ROUTER_MAXAGE));
+ 	case IGMP_v1_HOST_MEMBERSHIP_REPORT:
+ 	case IGMP_v2_HOST_MEMBERSHIP_REPORT:
+ 		if (igmplen != IGMP_MINLEN ||
+@@ -1356,32 +1484,97 @@
+ 	}
+ 
+ 	return (0);
++}
++
++/*
++ * Common eligibility test for an MDB forwarding destination: not the source,
++ * not blocked by IFBIF_PRIVATE, not STP-discarding, and running.
++ */
++static bool
++bridge_mdb_dest_ok(struct bridge_iflist *sbif, struct bridge_iflist *dbif,
++    struct ifnet *src_if)
++{
++	if (dbif->bif_ifp == src_if)
++		return (false);
++	if (sbif != NULL &&
++	    (sbif->bif_flags & dbif->bif_flags & IFBIF_PRIVATE))
++		return (false);
++	if ((dbif->bif_flags & IFBIF_STP) &&
++	    dbif->bif_stp.bp_state == BSTP_IFSTATE_DISCARDING)
++		return (false);
++	if ((dbif->bif_ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
++		return (false);
++	return (true);
++}
++
++/*
++ * Forward one copy of m to dst_if.  The single "last" destination is handed
++ * the original mbuf (setting *used); every other destination gets an m_dup.
++ * Mirrors the per-port replication that bridge_broadcast() performs.
++ */
++static void
++bridge_mdb_forward_one(struct bridge_softc *sc, struct mbuf *m,
++    struct bridge_iflist *dbif, bool last, bool *used)
++{
++	struct ifnet *dst_if = dbif->bif_ifp;
++	struct mbuf *mc;
++	int i;
++
++	if (last) {
++		mc = m;
++		*used = true;
++	} else {
++		mc = m_dup(m, M_NOWAIT);
++		if (mc == NULL) {
++			if_inc_counter(sc->sc_ifp, IFCOUNTER_OERRORS, 1);
++			return;
++		}
++	}
++
++	if (PFIL_HOOKED_OUT_46) {
++		if (!last) {
++			i = min(mc->m_pkthdr.len, max_protohdr);
++			mc = m_copyup(mc, i, ETHER_ALIGN);
++			if (mc == NULL) {
++				if_inc_counter(sc->sc_ifp, IFCOUNTER_OERRORS, 1);
++				return;
++			}
++		}
++		if (bridge_pfil(&mc, NULL, dst_if, PFIL_OUT) != 0)
++			return;
++		if (mc == NULL)
++			return;
++	}
++
++	bridge_enqueue(sc, dst_if, mc);
+ }
+ 
+ /*
+  * bridge_mdb_forward:
+  *
+  *	Look up an IPv4 multicast destination in the MDB and forward only to
+- *	member interfaces that have a learned listener for the group.  Returns
+- *	true if the MDB handled the packet (caller must not flood); returns
+- *	false if the group is unknown and the caller should fall back to
+- *	flooding.  Consumes m on a true return.
++ *	member interfaces that have a learned listener for the group, plus any
++ *	learned multicast-router ports on the frame's VLAN.  Returns true if
++ *	the MDB handled the packet (caller must not flood); returns false if
++ *	the group is unknown and the caller should fall back to flooding.
++ *	Consumes m on a true return.
+  */
+ static bool
+ bridge_mdb_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+     struct mbuf *m)
+ {
+ 	struct bridge_mdb_entry *bmd;
+-	struct bridge_mdb_member *bmm, *last;
++	struct bridge_mdb_member *bmm;
++	struct bridge_mdb_router *bmr;
++	struct bridge_iflist *last;
+ 	struct bridge_mdb_key key;
+ 	struct ether_header *eh;
+ 	struct ether_vlan_header evh;
+ 	struct ip ip;
+-	struct ifnet *src_if, *dst_if;
++	struct ifnet *src_if;
+ 	ether_vlanid_t vlan;
+ 	uint16_t ether_type;
+-	struct mbuf *mc;
+-	int i, ipoff;
++	int ipoff;
+ 	bool used;
+ 
+ 	NET_EPOCH_ASSERT();
+@@ -1451,30 +1644,32 @@
+ 	src_if = m->m_pkthdr.rcvif;
+ 
+ 	/*
+-	 * Walk the member list once to find the last eligible interface so
+-	 * the original mbuf can be handed to it without an extra m_dup.
++	 * The delivery set is the learned listener ports for this group plus
++	 * any multicast-router ports on the frame's VLAN that are not already
++	 * listeners.  Walk both once to find the last eligible interface so the
++	 * original mbuf can be handed to it without an extra m_dup.
+ 	 */
+ 	last = NULL;
+ 	CK_LIST_FOREACH(bmm, &bmd->bmd_members, bmm_next) {
+-		struct bridge_iflist *dbif = bmm->bmm_bif;
+-
+-		if (dbif->bif_ifp == src_if)
++		if (!bridge_mdb_dest_ok(sbif, bmm->bmm_bif, src_if))
+ 			continue;
+-		if (sbif != NULL &&
+-		    (sbif->bif_flags & dbif->bif_flags & IFBIF_PRIVATE))
++		last = bmm->bmm_bif;
++	}
++	CK_LIST_FOREACH(bmr, &sc->sc_mdbrouters, bmr_next) {
++		if (bmr->bmr_vlan != vlan)
+ 			continue;
+-		if ((dbif->bif_flags & IFBIF_STP) &&
+-		    dbif->bif_stp.bp_state == BSTP_IFSTATE_DISCARDING)
++		if (bridge_mdb_member_lookup(bmd, bmr->bmr_bif) != NULL)
+ 			continue;
+-		if ((dbif->bif_ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
++		if (!bridge_mdb_dest_ok(sbif, bmr->bmr_bif, src_if))
+ 			continue;
+-		last = bmm;
++		last = bmr->bmr_bif;
+ 	}
+ 
+ 	if (last == NULL) {
+ 		/*
+-		 * Group is known but every learned port is either the source
+-		 * or ineligible.  Drop to suppress unneeded replication.
++		 * Group is known but every learned port (listener or router)
++		 * is either the source or ineligible.  Drop to suppress
++		 * unneeded replication.
+ 		 */
+ 		m_freem(m);
+ 		return (true);
+@@ -1482,48 +1677,20 @@
+ 
+ 	used = false;
+ 	CK_LIST_FOREACH(bmm, &bmd->bmd_members, bmm_next) {
+-		struct bridge_iflist *dbif = bmm->bmm_bif;
+-
+-		dst_if = dbif->bif_ifp;
+-		if (dst_if == src_if)
++		if (!bridge_mdb_dest_ok(sbif, bmm->bmm_bif, src_if))
+ 			continue;
+-		if (sbif != NULL &&
+-		    (sbif->bif_flags & dbif->bif_flags & IFBIF_PRIVATE))
++		bridge_mdb_forward_one(sc, m, bmm->bmm_bif,
++		    bmm->bmm_bif == last, &used);
++	}
++	CK_LIST_FOREACH(bmr, &sc->sc_mdbrouters, bmr_next) {
++		if (bmr->bmr_vlan != vlan)
+ 			continue;
+-		if ((dbif->bif_flags & IFBIF_STP) &&
+-		    dbif->bif_stp.bp_state == BSTP_IFSTATE_DISCARDING)
++		if (bridge_mdb_member_lookup(bmd, bmr->bmr_bif) != NULL)
+ 			continue;
+-		if ((dst_if->if_drv_flags & IFF_DRV_RUNNING) == 0)
++		if (!bridge_mdb_dest_ok(sbif, bmr->bmr_bif, src_if))
+ 			continue;
+-
+-		if (bmm == last) {
+-			mc = m;
+-			used = true;
+-		} else {
+-			mc = m_dup(m, M_NOWAIT);
+-			if (mc == NULL) {
+-				if_inc_counter(sc->sc_ifp, IFCOUNTER_OERRORS, 1);
+-				continue;
+-			}
+-		}
+-
+-		if (PFIL_HOOKED_OUT_46) {
+-			if (!used) {
+-				i = min(mc->m_pkthdr.len, max_protohdr);
+-				mc = m_copyup(mc, i, ETHER_ALIGN);
+-				if (mc == NULL) {
+-					if_inc_counter(sc->sc_ifp,
+-					    IFCOUNTER_OERRORS, 1);
+-					continue;
+-				}
+-			}
+-			if (bridge_pfil(&mc, NULL, dst_if, PFIL_OUT) != 0)
+-				continue;
+-			if (mc == NULL)
+-				continue;
+-		}
+-
+-		bridge_enqueue(sc, dst_if, mc);
++		bridge_mdb_forward_one(sc, m, bmr->bmr_bif,
++		    bmr->bmr_bif == last, &used);
+ 	}
+ 	if (!used)
+ 		m_freem(m);
+@@ -1533,6 +1700,19 @@
+ #endif
+ 
+ static void
++bridge_mdb_flush_router(struct bridge_softc *sc, struct bridge_iflist *bif)
++{
++	struct bridge_mdb_router *bmr, *nbmr;
++
++	BRIDGE_RT_LOCK_ASSERT(sc);
++
++	CK_LIST_FOREACH_SAFE(bmr, &sc->sc_mdbrouters, bmr_next, nbmr) {
++		if (bmr->bmr_bif == bif)
++			bridge_mdb_remove_router(sc, bmr);
++	}
++}
++
++static void
+ bridge_mdb_flush_member(struct bridge_softc *sc, struct bridge_iflist *bif)
+ {
+ 	struct bridge_mdb_entry *bmd, *nbmd;
+@@ -1547,6 +1727,8 @@
+ 				break;
+ 		}
+ 	}
++
++	bridge_mdb_flush_router(sc, bif);
+ }
+ 
+ static void
+@@ -1554,6 +1736,7 @@
+ {
+ 	struct bridge_mdb_entry *bmd, *nbmd;
+ 	struct bridge_mdb_member *bmm, *nbmm;
++	struct bridge_mdb_router *bmr, *nbmr;
+ 
+ 	BRIDGE_RT_LOCK_ASSERT(sc);
+ 
+@@ -1567,20 +1750,31 @@
+ 				break;
+ 		}
+ 	}
++
++	CK_LIST_FOREACH_SAFE(bmr, &sc->sc_mdbrouters, bmr_next, nbmr) {
++		if (bmr->bmr_expire == 0 ||
++		    time_uptime < bmr->bmr_expire)
++			continue;
++		bridge_mdb_remove_router(sc, bmr);
++	}
+ }
+ 
+ static void
+ bridge_mdb_fini(struct bridge_softc *sc)
+ {
+ 	struct bridge_mdb_entry *bmd;
++	struct bridge_mdb_router *bmr;
+ 
+ 	BRIDGE_RT_LOCK_ASSERT(sc);
+ 
+ 	while ((bmd = CK_LIST_FIRST(&sc->sc_mdb)) != NULL)
+ 		bridge_mdb_destroy_entry(sc, bmd);
+ 
+-	KASSERT(sc->sc_mdbcnt == 0 && sc->sc_mdbmembercnt == 0,
+-	    ("%s: MDB entries remain", __func__));
++	while ((bmr = CK_LIST_FIRST(&sc->sc_mdbrouters)) != NULL)
++		bridge_mdb_remove_router(sc, bmr);
++
++	KASSERT(sc->sc_mdbcnt == 0 && sc->sc_mdbmembercnt == 0 &&
++	    sc->sc_mdbroutercnt == 0, ("%s: MDB entries remain", __func__));
+ }
+ 
+ static void
+diff --git a/share/man/man4/bridge.4 b/share/man/man4/bridge.4
+--- a/share/man/man4/bridge.4
++++ b/share/man/man4/bridge.4
+@@ -464,6 +464,13 @@
+ This is disabled by default; forwarding falls back to flooding whenever no
+ listener state is known, for non-IP multicast, and for exempt link-local
+ control traffic.
++.Pp
++Member ports on which IGMP membership queries are seen are additionally
++learned as multicast-router ports.
++A learned group is forwarded to its listener ports and to any router port on
++the same VLAN, so that pruning does not blackhole multicast that a router
++needs to relay.
++Router ports are aged like listener state and are refreshed by each query.
+ The following
+ .Xr sysctl 8
+ variables control and observe this behavior:
+@@ -493,6 +500,9 @@
+ .It Va net.link.bridge.mdb_expired
+ Read-only count of MDB listener entries removed because their membership aged
+ out.
++.It Va net.link.bridge.mdb_routers
++Read-only count of multicast-router ports currently learned from IGMP
++membership queries.
+ .El
+ .Pp
+ Writing any value to one of the read-only counters resets it to zero.
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -818,6 +818,7 @@
+ group_fwd_mask_cleanup()
+ {
+ 	vnet_cleanup
++	
+ }
+ 
+ bridge_mdb_vnet_topology_create()
+@@ -844,7 +845,25 @@
+ 	ifconfig ${mdb_bridge} addm ${mdb_listener_epair}a
+ 	ifconfig ${mdb_bridge} addm ${mdb_idle_epair}a
+ }
++
++# Extend the base sender/listener/idle topology with a fourth "router" jail
++# (mdbr) whose port stands in for a link to a multicast router/querier.
++bridge_mdb_router_topology_create()
++{
++	bridge_mdb_vnet_topology_create
+ 
++	mdb_router_epair=$(vnet_mkepair)
++	vnet_mkjail mdbr ${mdb_router_epair}b
++	jexec mdbr ifconfig ${mdb_router_epair}b 192.0.2.4/24 up
++	ifconfig ${mdb_router_epair}a up
++	ifconfig ${mdb_bridge} addm ${mdb_router_epair}a
++
++	# The router jail's routing table only knows its own /24; without a
++	# multicast route the IGMP query send fails with ENETUNREACH even
++	# though IP_MULTICAST_IF names this interface.
++	jexec mdbr route add -net 224.0.0.0/4 -interface ${mdb_router_epair}b
++}
++
+ # Compile a small helper that joins a multicast group and holds the socket
+ # open.  VNET jails share the host filesystem, so a binary written to /tmp on
+ # the host is reachable via jexec without copying.
+@@ -880,6 +899,84 @@
+ 	    atf_skip "could not compile mcast_join helper"
+ }
+ 
++# Compile a helper that emits IGMPv2 general membership queries, standing in
++# for a multicast router/querier.  It uses a raw IPPROTO_IGMP socket so the
++# kernel builds the IP header; only the 8-byte IGMP body (with checksum) is
++# supplied.  argv: <local-interface-addr> <count>.
++bridge_mdb_compile_query_helper()
++{
++	cat > /tmp/mcast_query_bridge_test.c << 'CSRC'
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <netinet/igmp.h>
++#include <arpa/inet.h>
++#include <string.h>
++#include <stdlib.h>
++#include <unistd.h>
++
++static unsigned short
++cksum(const unsigned char *b, int len)
++{
++	unsigned long sum = 0;
++	int i;
++
++	for (i = 0; i + 1 < len; i += 2)
++		sum += (b[i] << 8) | b[i + 1];
++	if (len & 1)
++		sum += b[len - 1] << 8;
++	while (sum >> 16)
++		sum = (sum & 0xffff) + (sum >> 16);
++	return (unsigned short)(~sum);
++}
++
++int
++main(int argc, char **argv)
++{
++	struct sockaddr_in dst;
++	struct in_addr mif;
++	unsigned char igmp[8];
++	unsigned short sum;
++	unsigned char ttl = 1;
++	int s, i, n;
++
++	if (argc != 3)
++		return 1;
++	n = atoi(argv[2]);
++
++	s = socket(AF_INET, SOCK_RAW, IPPROTO_IGMP);
++	if (s < 0)
++		return 1;
++
++	mif.s_addr = inet_addr(argv[1]);
++	if (setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, &mif, sizeof(mif)) < 0)
++		return 1;
++	setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
++
++	memset(igmp, 0, sizeof(igmp));
++	igmp[0] = IGMP_HOST_MEMBERSHIP_QUERY;	/* 0x11 */
++	igmp[1] = 100;				/* max response time, 10s */
++	sum = cksum(igmp, sizeof(igmp));
++	igmp[2] = sum >> 8;
++	igmp[3] = sum & 0xff;
++
++	memset(&dst, 0, sizeof(dst));
++	dst.sin_family = AF_INET;
++	dst.sin_addr.s_addr = inet_addr("224.0.0.1");
++
++	for (i = 0; i < n; i++) {
++		if (sendto(s, igmp, sizeof(igmp), 0,
++		    (struct sockaddr *)&dst, sizeof(dst)) < 0)
++			return 1;
++		usleep(200000);
++	}
++	return 0;
++}
++CSRC
++	cc -o /tmp/mcast_query_bridge_test /tmp/mcast_query_bridge_test.c || \
++	    atf_skip "could not compile mcast_query helper"
++}
++
+ atf_test_case "mdb_vnet_topology" "cleanup"
+ mdb_vnet_topology_head()
+ {
+@@ -1074,6 +1171,89 @@
+ 	vnet_cleanup
+ }
+ 
++atf_test_case "mdb_router_forward" "cleanup"
++mdb_router_forward_head()
++{
++	atf_set descr 'bridge forwards learned multicast to IGMP-query router ports'
++	atf_set require.user root
++	atf_set require.progs "cc tcpdump timeout"
++}
++
++mdb_router_forward_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge_mdb_router_topology_create
++
++	# Snooping is off by default; enable it so the MDB learns listener and
++	# router state and the forwarding path prunes accordingly.
++	atf_check -s exit:0 -o ignore \
++	    sysctl net.link.bridge.igmp_snooping=1
++
++	bridge_mdb_compile_join_helper
++	bridge_mdb_compile_query_helper
++
++	# Listener joins 239.1.1.1 on its port.
++	jexec mdbl /tmp/mcast_join_bridge_test 239.1.1.1 192.0.2.2 30 &
++	joiner_pid=$!
++	sleep 2
++
++	# Router jail emits IGMP membership queries; the bridge should learn
++	# its port as a multicast-router port.
++	jexec mdbr /tmp/mcast_query_bridge_test 192.0.2.4 3
++	sleep 1
++
++	# The router port must have been learned.
++	atf_check -o match:'^[1-9][0-9]*$' \
++	    sysctl -n net.link.bridge.mdb_routers
++
++	jexec mdbs route add -net 224.0.0.0/4 \
++	    -interface ${mdb_sender_epair}b >/dev/null 2>&1 || true
++
++	rcap="${PWD}/mdb_router.tcpdump"
++	icap="${PWD}/mdb_router_idle.tcpdump"
++	rm -f "${rcap}" "${icap}"
++
++	# The router port should receive the group even though it never joined;
++	# the idle port must still be pruned.
++	jexec mdbr sh -c "timeout 4 tcpdump --immediate-mode -n \
++	    -i ${mdb_router_epair}b -c 1 \
++	    'icmp and dst host 239.1.1.1' > ${rcap} 2>&1" &
++	router_tcpdump=$!
++	jexec mdbi sh -c "timeout 4 tcpdump --immediate-mode -n \
++	    -i ${mdb_idle_epair}b -c 1 \
++	    'icmp and dst host 239.1.1.1' > ${icap} 2>&1" &
++	idle_tcpdump=$!
++	sleep 1
++
++	jexec mdbs ping -c 3 -t 1 239.1.1.1 >/dev/null 2>&1 || true
++
++	wait ${router_tcpdump}
++	router_status=$?
++	wait ${idle_tcpdump}
++	idle_status=$?
++
++	kill ${joiner_pid} 2>/dev/null || true
++
++	# router_status 0 means the router port captured the frame (correct).
++	if [ ${router_status} -ne 0 ]; then
++		atf_fail "router port did not receive multicast; router learning failed"
++	fi
++	# idle_status 0 means the idle port captured a frame, i.e. pruning broke.
++	if [ ${idle_status} -eq 0 ]; then
++		cat "${icap}"
++		atf_fail "idle port received multicast that MDB should have pruned"
++	fi
++}
++
++mdb_router_forward_cleanup()
++{
++	rm -f /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c
++	rm -f /tmp/mcast_query_bridge_test /tmp/mcast_query_bridge_test.c
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -1221,6 +1401,7 @@
+ 	atf_add_test_case "mdb_unknown_multicast_flood"
+ 	atf_add_test_case "mdb_selective_forward"
+ 	atf_add_test_case "mdb_counters"
++	atf_add_test_case "mdb_router_forward"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

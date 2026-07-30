@@ -1,0 +1,236 @@
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -1463,16 +1463,56 @@
+ 
+ 			if (pass == 1 &&
+ 			    bridge_mdb_igmp_group_valid(rec.ig_group)) {
++				/*
++				 * Reduce each record conservatively to ASM
++				 * (*,G) listener state.  Any record that
++				 * expresses positive interest in the group
++				 * creates or refreshes (*,G) state for the
++				 * ingress port; source lists are not used to
++				 * narrow delivery, so a source-specific
++				 * request may be over-delivered but never
++				 * under-delivered.  Records that only revoke
++				 * interest never remove state eagerly; aging
++				 * expires it, mirroring the IGMPv2 leave
++				 * handling.
++				 */
+ 				switch (rec.ig_type) {
+ 				case IGMP_MODE_IS_EXCLUDE:
+ 				case IGMP_CHANGE_TO_EXCLUDE_MODE:
+-					if (nsrc == 0)
++					/*
++					 * EXCLUDE mode asks for all sources
++					 * except those listed: (*,G) interest
++					 * for any source count.
++					 */
++					(void)bridge_mdb_add_member(sc,
++					    AF_INET, &rec.ig_group,
++					    vlan, bif,
++					    BRIDGE_MDB_IGMP_MAXAGE);
++					break;
++				case IGMP_MODE_IS_INCLUDE:
++				case IGMP_CHANGE_TO_INCLUDE_MODE:
++				case IGMP_ALLOW_NEW_SOURCES:
++					/*
++					 * INCLUDE-family records with a
++					 * non-empty source list ask for at
++					 * least those sources.  An empty
++					 * list carries no interest:
++					 * IS_IN({}) and ALLOW({}) are
++					 * no-ops, and TO_IN({}) is the
++					 * IGMPv3 leave.
++					 */
++					if (nsrc > 0)
+ 						(void)bridge_mdb_add_member(sc,
+ 						    AF_INET, &rec.ig_group,
+ 						    vlan, bif,
+ 						    BRIDGE_MDB_IGMP_MAXAGE);
+ 					break;
+ 				default:
++					/*
++					 * BLOCK_OLD_SOURCES and unknown
++					 * record types drive no state
++					 * change.
++					 */
+ 					break;
+ 				}
+ 			}
+--- a/share/man/man4/bridge.4
++++ b/share/man/man4/bridge.4
+@@ -464,6 +464,20 @@
+ This is disabled by default; forwarding falls back to flooding whenever no
+ listener state is known, for non-IP multicast, and for exempt link-local
+ control traffic.
++.Pp
++IGMPv3 group records are reduced conservatively to any-source
++.Pq (*,G)
++listener state.
++Records that express positive interest in a group, namely
++EXCLUDE-mode records with any source list and INCLUDE-mode or
++ALLOW_NEW_SOURCES records with a non-empty source list, create or refresh
++listener state for the ingress port.
++Source lists are not used to narrow delivery, so a source-specific join may
++receive traffic from more sources than requested but never fewer.
++Records that only revoke interest, such as BLOCK_OLD_SOURCES or a
++CHANGE_TO_INCLUDE_MODE record with an empty source list (the IGMPv3 leave),
++never remove listener state immediately; state expires through aging, as with
++an IGMPv2 leave.
+ .Pp
+ Member ports on which IGMP membership queries are seen are additionally
+ learned as multicast-router ports.
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -975,7 +975,46 @@
+ CSRC
+ 	cc -o /tmp/mcast_query_bridge_test /tmp/mcast_query_bridge_test.c || \
+ 	    atf_skip "could not compile mcast_query helper"
++}
++
++# Compile a helper that performs an IGMPv3 source-specific join
++# (IP_ADD_SOURCE_MEMBERSHIP) and holds the socket open.  On an IGMPv3 stack
++# this makes the kernel emit INCLUDE-family group records rather than a
++# version 2 report.  argv: <group> <source> <local-interface-addr> <secs>.
++bridge_mdb_compile_source_join_helper()
++{
++	cat > /tmp/mcast_source_join_bridge_test.c << 'CSRC'
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <string.h>
++#include <stdlib.h>
++#include <unistd.h>
++int main(int argc, char **argv)
++{
++	struct ip_mreq_source mreqs;
++	int s, on = 1, secs;
++	if (argc != 5) return 1;
++	secs = atoi(argv[4]);
++	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	if (s < 0) return 1;
++	setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
++	memset(&mreqs, 0, sizeof(mreqs));
++	mreqs.imr_multiaddr.s_addr = inet_addr(argv[1]);
++	mreqs.imr_sourceaddr.s_addr = inet_addr(argv[2]);
++	mreqs.imr_interface.s_addr = inet_addr(argv[3]);
++	if (setsockopt(s, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP,
++	    &mreqs, sizeof(mreqs)) < 0)
++		return 1;
++	sleep(secs);
++	return 0;
+ }
++CSRC
++	cc -o /tmp/mcast_source_join_bridge_test \
++	    /tmp/mcast_source_join_bridge_test.c || \
++	    atf_skip "could not compile mcast_source_join helper"
++}
+ 
+ atf_test_case "mdb_vnet_topology" "cleanup"
+ mdb_vnet_topology_head()
+@@ -1254,6 +1293,95 @@
+ 	vnet_cleanup
+ }
+ 
++atf_test_case "mdb_igmpv3_source_join" "cleanup"
++mdb_igmpv3_source_join_head()
++{
++	atf_set descr 'bridge MDB learns ASM state from IGMPv3 source-specific joins'
++	atf_set require.user root
++	atf_set require.progs "cc tcpdump timeout"
++}
++
++mdb_igmpv3_source_join_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge_mdb_vnet_topology_create
++
++	# Snooping is off by default; enable it so the MDB learns listener
++	# state and the forwarding path prunes to interested ports.
++	atf_check -s exit:0 -o ignore \
++	    sysctl net.link.bridge.igmp_snooping=1
++
++	# Pin the listener jail's IGMP to version 3 so the source-specific
++	# join below emits IGMPv3 INCLUDE-family records (TO_IN({S})) rather
++	# than a version 1/2 report -- the record class this test exercises.
++	atf_check -s exit:0 -o ignore \
++	    jexec mdbl sysctl net.inet.igmp.default_version=3
++
++	bridge_mdb_compile_source_join_helper
++
++	# Source-specific join of (192.0.2.1, 239.1.1.1) from the listener
++	# jail.  Before the ASM refinement the bridge ignored INCLUDE-family
++	# records and kept flooding; it must now reduce them to (*,G)
++	# listener state.
++	jexec mdbl /tmp/mcast_source_join_bridge_test 239.1.1.1 192.0.2.1 \
++	    192.0.2.2 30 &
++	joiner_pid=$!
++	sleep 2
++
++	# The INCLUDE-mode record must have created (*,G) state.
++	atf_check -o match:'^[1-9][0-9]*$' \
++	    sysctl -n net.link.bridge.mdb_entries
++
++	jexec mdbs route add -net 224.0.0.0/4 \
++	    -interface ${mdb_sender_epair}b >/dev/null 2>&1 || true
++
++	lcap="${PWD}/mdb_igmpv3_listener.tcpdump"
++	icap="${PWD}/mdb_igmpv3_idle.tcpdump"
++	rm -f "${lcap}" "${icap}"
++
++	# The listener port must receive the group it asked for (the ASM
++	# reduction over-delivers a source-specific request, never
++	# under-delivers it); the idle port must still be pruned.
++	jexec mdbl sh -c "timeout 4 tcpdump --immediate-mode -n \
++	    -i ${mdb_listener_epair}b -c 1 \
++	    'icmp and dst host 239.1.1.1' > ${lcap} 2>&1" &
++	listener_tcpdump=$!
++	jexec mdbi sh -c "timeout 4 tcpdump --immediate-mode -n \
++	    -i ${mdb_idle_epair}b -c 1 \
++	    'icmp and dst host 239.1.1.1' > ${icap} 2>&1" &
++	idle_tcpdump=$!
++	sleep 1
++
++	jexec mdbs ping -c 3 -t 1 239.1.1.1 >/dev/null 2>&1 || true
++
++	wait ${listener_tcpdump}
++	listener_status=$?
++	wait ${idle_tcpdump}
++	idle_status=$?
++
++	kill ${joiner_pid} 2>/dev/null || true
++
++	# listener_status 0 means the listener port captured the frame.
++	if [ ${listener_status} -ne 0 ]; then
++		atf_fail "listener port did not receive its source-joined group"
++	fi
++	# idle_status 0 means the idle port captured a frame, i.e. the ASM
++	# reduction created state but pruning delivered too broadly.
++	if [ ${idle_status} -eq 0 ]; then
++		cat "${icap}"
++		atf_fail "idle port received multicast that MDB should have pruned"
++	fi
++}
++
++mdb_igmpv3_source_join_cleanup()
++{
++	rm -f /tmp/mcast_source_join_bridge_test \
++	    /tmp/mcast_source_join_bridge_test.c
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -1402,6 +1530,7 @@
+ 	atf_add_test_case "mdb_selective_forward"
+ 	atf_add_test_case "mdb_counters"
+ 	atf_add_test_case "mdb_router_forward"
++	atf_add_test_case "mdb_igmpv3_source_join"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

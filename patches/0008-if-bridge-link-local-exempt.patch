@@ -1,0 +1,164 @@
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -1320,6 +1320,25 @@
+ bridge_mdb_igmp_group_valid(struct in_addr group)
+ {
+ 	return (IN_MULTICAST(ntohl(group.s_addr)));
++}
++
++/*
++ * Whether listener state may be learned for a group.  RFC 4541 section
++ * 2.1.1 requires that traffic addressed to the link-local 224.0.0.0/24
++ * block always be forwarded on all ports, so membership in those groups is
++ * never recorded.  Learning them would let one reporting host cause the
++ * bridge to prune link-local control protocols -- mDNS on 224.0.0.251, OSPF
++ * on 224.0.0.5 and 224.0.0.6 -- away from ports whose own reports were
++ * suppressed by IGMP report suppression.  This is reachable in practice:
++ * FreeBSD reports these groups by default (net.inet.igmp.sendlocal=1).
++ *
++ * A report for such a group is well-formed, just not actionable, so callers
++ * treat it as accepted-with-no-effect rather than as a parse rejection.
++ */
++static bool
++bridge_mdb_igmp_group_snoopable(struct in_addr group)
++{
++	return (!IN_LOCAL_GROUP(ntohl(group.s_addr)));
+ }
+ 
+ static void
+@@ -1412,6 +1431,8 @@
+ 		    !bridge_mdb_igmp_group_valid(igmp.igmp_group) ||
+ 		    !in_hosteq(igmp.igmp_group, ip.ip_dst))
+ 			return (EINVAL);
++		if (!bridge_mdb_igmp_group_snoopable(igmp.igmp_group))
++			return (0);
+ 		return (bridge_mdb_add_member(sc, AF_INET, &igmp.igmp_group,
+ 		    vlan, bif, BRIDGE_MDB_IGMP_MAXAGE));
+ 	case IGMP_HOST_LEAVE_MESSAGE:
+@@ -1462,7 +1483,8 @@
+ 				return (EINVAL);
+ 
+ 			if (pass == 1 &&
+-			    bridge_mdb_igmp_group_valid(rec.ig_group)) {
++			    bridge_mdb_igmp_group_valid(rec.ig_group) &&
++			    bridge_mdb_igmp_group_snoopable(rec.ig_group)) {
+ 				/*
+ 				 * Reduce each record conservatively to ASM
+ 				 * (*,G) listener state.  Any record that
+@@ -1651,6 +1673,16 @@
+ 	m_copydata(m, ipoff, sizeof(ip), (caddr_t)&ip);
+ 
+ 	if (!IN_MULTICAST(ntohl(ip.ip_dst.s_addr)))
++		return (false);
++
++	/*
++	 * Never prune the link-local 224.0.0.0/24 block (RFC 4541 2.1.1):
++	 * flood it exactly as the bridge did before snooping existed.
++	 * Learning already refuses these groups, but checking on the
++	 * forwarding side too means listener state recorded by an earlier
++	 * kernel cannot prune control traffic after an upgrade.
++	 */
++	if (IN_LOCAL_GROUP(ntohl(ip.ip_dst.s_addr)))
+ 		return (false);
+ 
+ 	if (bridge_mdb_key_init(&key, AF_INET, &ip.ip_dst, vlan) != 0)
+--- a/share/man/man4/bridge.4
++++ b/share/man/man4/bridge.4
+@@ -465,6 +465,19 @@
+ listener state is known, for non-IP multicast, and for exempt link-local
+ control traffic.
+ .Pp
++The link-local
++.Li 224.0.0.0/24
++block is never snooped and never pruned, as required by RFC 4541.
++Membership reports naming a group in that block are parsed but create no
++listener state, and traffic addressed to it is always forwarded to every
++port.
++Without this exemption a single reporting host could cause link-local
++control protocols, such as mDNS on
++.Li 224.0.0.251
++or OSPF on
++.Li 224.0.0.5 ,
++to be pruned away from ports whose own membership reports were suppressed.
++.Pp
+ IGMPv3 group records are reduced conservatively to any-source
+ .Pq (*,G)
+ listener state.
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -1379,6 +1379,67 @@
+ {
+ 	rm -f /tmp/mcast_source_join_bridge_test \
+ 	    /tmp/mcast_source_join_bridge_test.c
++	vnet_cleanup
++}
++
++atf_test_case "mdb_link_local_exempt" "cleanup"
++mdb_link_local_exempt_head()
++{
++	atf_set descr 'bridge never snoops or prunes the link-local 224.0.0.0/24 block'
++	atf_set require.user root
++	atf_set require.progs "cc tcpdump timeout"
++}
++
++mdb_link_local_exempt_body()
++{
++	vnet_init
++	vnet_init_bridge
++
++	bridge_mdb_vnet_topology_create
++
++	atf_check -s exit:0 -o ignore \
++	    sysctl net.link.bridge.igmp_snooping=1
++
++	bridge_mdb_compile_join_helper
++
++	# 224.0.0.251 (mDNS) is inside the link-local block.  FreeBSD reports
++	# it by default (net.inet.igmp.sendlocal=1), so the bridge does see a
++	# membership report for it -- but RFC 4541 2.1.1 requires that this
++	# traffic still reach every port, so no listener state may be created.
++	jexec mdbl /tmp/mcast_join_bridge_test 224.0.0.251 192.0.2.2 30 &
++	joiner_pid=$!
++	sleep 2
++
++	atf_check -o match:'^0$' \
++	    sysctl -n net.link.bridge.mdb_entries
++
++	jexec mdbs route add -net 224.0.0.0/4 \
++	    -interface ${mdb_sender_epair}b >/dev/null 2>&1 || true
++
++	capture="${PWD}/mdb_link_local.tcpdump"
++	rm -f "${capture}"
++
++	# The uninterested port must still receive it.
++	jexec mdbi sh -c "timeout 4 tcpdump --immediate-mode -n \
++	    -i ${mdb_idle_epair}b -c 1 \
++	    'icmp and dst host 224.0.0.251' > ${capture} 2>&1" &
++	tcpdump_pid=$!
++	sleep 1
++
++	jexec mdbs ping -c 3 -t 1 224.0.0.251 >/dev/null 2>&1 || true
++	wait ${tcpdump_pid}
++	idle_status=$?
++
++	kill ${joiner_pid} 2>/dev/null || true
++
++	if [ ${idle_status} -ne 0 ]; then
++		atf_fail "link-local 224.0.0.251 was pruned from an uninterested port"
++	fi
++}
++
++mdb_link_local_exempt_cleanup()
++{
++	rm -f /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c
+ 	vnet_cleanup
+ }
+ 
+@@ -1531,6 +1592,7 @@
+ 	atf_add_test_case "mdb_counters"
+ 	atf_add_test_case "mdb_router_forward"
+ 	atf_add_test_case "mdb_igmpv3_source_join"
++	atf_add_test_case "mdb_link_local_exempt"
+ 	atf_add_test_case "member_ifaddrs_enabled"
+ 	atf_add_test_case "member_ifaddrs_disabled"
+ 	atf_add_test_case "member_ifaddrs_vlan"

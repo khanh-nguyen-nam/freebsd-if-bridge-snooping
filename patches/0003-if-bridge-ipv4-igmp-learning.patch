@@ -1,8 +1,18 @@
+From e6bec064e1f3757be761ec5c44cbcd97774080ed Mon Sep 17 00:00:00 2001
+From: Khanh Nguyen <namkhanh052005@gmail.com>
+Date: Fri, 7 Aug 2026 15:00:56 +0700
+Subject: if_bridge: learn IPv4 multicast listeners from IGMP
+
+---
+ sys/net/if_bridge.c             | 185 ++++++++++++++++++++++++++++++++
+ tests/sys/net/if_bridge_test.sh |  42 ++++++++
+ 2 files changed, 227 insertions(+)
+
 diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
-index e76b92969..65f08dd0f 100644
+index adebce153..a79a77129 100644
 --- a/sys/net/if_bridge.c
 +++ b/sys/net/if_bridge.c
-@@ -115,6 +115,9 @@
+@@ -118,6 +118,9 @@
  #include <netinet/in.h>
  #include <netinet/in_systm.h>
  #include <netinet/in_var.h>
@@ -12,7 +22,7 @@ index e76b92969..65f08dd0f 100644
  #include <netinet/ip.h>
  #include <netinet/ip_var.h>
  #ifdef INET6
-@@ -196,6 +199,14 @@
+@@ -199,6 +202,14 @@
  #define	BRIDGE_MDB_PRUNE_PERIOD		(5 * 60)
  #endif
  
@@ -27,7 +37,7 @@ index e76b92969..65f08dd0f 100644
  /*
   * List of capabilities to possibly mask on the member interface.
   */
-@@ -397,6 +408,15 @@ static void	bridge_mdb_flush_member(struct bridge_softc *,
+@@ -412,6 +423,15 @@ static void	bridge_mdb_flush_member(struct bridge_softc *,
  static int	bridge_mdb_add_member(struct bridge_softc *, sa_family_t,
  		    const void *, ether_vlanid_t, struct bridge_iflist *,
  		    unsigned int) __unused;
@@ -43,7 +53,7 @@ index e76b92969..65f08dd0f 100644
  
  static int	bridge_rtnode_addr_cmp(const uint8_t *, const uint8_t *);
  static struct bridge_rtnode *bridge_rtnode_lookup(struct bridge_softc *,
-@@ -1085,6 +1105,168 @@ bridge_mdb_add_member(struct bridge_softc *sc, sa_family_t family,
+@@ -1172,6 +1192,168 @@ bridge_mdb_add_member(struct bridge_softc *sc, sa_family_t family,
  	return (error);
  }
  
@@ -212,7 +222,7 @@ index e76b92969..65f08dd0f 100644
  static void
  bridge_mdb_flush_member(struct bridge_softc *sc, struct bridge_iflist *bif)
  {
-@@ -2808,6 +2990,9 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+@@ -3108,6 +3290,9 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
  		/* ...forward it to all interfaces. */
  		if_inc_counter(ifp, IFCOUNTER_IMCASTS, 1);
  		dst_if = NULL;
@@ -223,10 +233,10 @@ index e76b92969..65f08dd0f 100644
  
  	/*
 diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
-index 6e693a646..4d478a5b6 100755
+index 2ff9cb41a..b524a588f 100755
 --- a/tests/sys/net/if_bridge_test.sh
 +++ b/tests/sys/net/if_bridge_test.sh
-@@ -872,6 +872,47 @@ mdb_vnet_topology_cleanup()
+@@ -876,6 +876,47 @@ mdb_vnet_topology_cleanup()
  	vnet_cleanup
  }
  
@@ -274,7 +284,7 @@ index 6e693a646..4d478a5b6 100755
  atf_test_case "member_ifaddrs_enabled" "cleanup"
  member_ifaddrs_enabled_head()
  {
-@@ -1016,6 +1057,7 @@ atf_init_test_cases()
+@@ -1560,6 +1601,7 @@ atf_init_test_cases()
  	atf_add_test_case "many_bridge_members"
  	atf_add_test_case "group_fwd_mask"
  	atf_add_test_case "mdb_vnet_topology"
@@ -282,3 +292,6 @@ index 6e693a646..4d478a5b6 100755
  	atf_add_test_case "member_ifaddrs_enabled"
  	atf_add_test_case "member_ifaddrs_disabled"
  	atf_add_test_case "member_ifaddrs_vlan"
+-- 
+2.39.3 (Apple Git-145)
+

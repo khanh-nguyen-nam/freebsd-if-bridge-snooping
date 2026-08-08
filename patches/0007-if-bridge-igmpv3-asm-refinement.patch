@@ -1,6 +1,44 @@
+From 8cbfa7f411c529ffd6409bd91f33403ac5c50a67 Mon Sep 17 00:00:00 2001
+From: Khanh Nguyen <namkhanh052005@gmail.com>
+Date: Fri, 7 Aug 2026 15:00:57 +0700
+Subject: if_bridge: widen IGMPv3 record handling to conservative ASM reduction
+
+---
+ share/man/man4/bridge.4         |  14 ++++
+ sys/net/if_bridge.c             |  42 ++++++++++-
+ tests/sys/net/if_bridge_test.sh | 129 ++++++++++++++++++++++++++++++++
+ 3 files changed, 184 insertions(+), 1 deletion(-)
+
+diff --git a/share/man/man4/bridge.4 b/share/man/man4/bridge.4
+index dab98f1e8..0298a3f50 100644
+--- a/share/man/man4/bridge.4
++++ b/share/man/man4/bridge.4
+@@ -615,6 +615,20 @@ This is disabled by default; forwarding falls back to flooding whenever no
+ listener state is known, for non-IP multicast, and for exempt link-local
+ control traffic.
+ .Pp
++IGMPv3 group records are reduced conservatively to any-source
++.Pq (*,G)
++listener state.
++Records that express positive interest in a group, namely
++EXCLUDE-mode records with any source list and INCLUDE-mode or
++ALLOW_NEW_SOURCES records with a non-empty source list, create or refresh
++listener state for the ingress port.
++Source lists are not used to narrow delivery, so a source-specific join may
++receive traffic from more sources than requested but never fewer.
++Records that only revoke interest, such as BLOCK_OLD_SOURCES or a
++CHANGE_TO_INCLUDE_MODE record with an empty source list (the IGMPv3 leave),
++never remove listener state immediately; state expires through aging, as with
++an IGMPv2 leave.
++.Pp
+ Member ports on which IGMP membership queries are seen are additionally
+ learned as multicast-router ports.
+ A learned group is forwarded to its listener ports and to any router port on
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+index 8d93c1ea4..1b6304a5b 100644
 --- a/sys/net/if_bridge.c
 +++ b/sys/net/if_bridge.c
-@@ -1463,16 +1463,56 @@
+@@ -1550,16 +1550,56 @@ bridge_mdb_igmp_v3_report(struct bridge_softc *sc, struct bridge_iflist *bif,
  
  			if (pass == 1 &&
  			    bridge_mdb_igmp_group_valid(rec.ig_group)) {
@@ -58,37 +96,14 @@
  					break;
  				}
  			}
---- a/share/man/man4/bridge.4
-+++ b/share/man/man4/bridge.4
-@@ -464,6 +464,20 @@
- This is disabled by default; forwarding falls back to flooding whenever no
- listener state is known, for non-IP multicast, and for exempt link-local
- control traffic.
-+.Pp
-+IGMPv3 group records are reduced conservatively to any-source
-+.Pq (*,G)
-+listener state.
-+Records that express positive interest in a group, namely
-+EXCLUDE-mode records with any source list and INCLUDE-mode or
-+ALLOW_NEW_SOURCES records with a non-empty source list, create or refresh
-+listener state for the ingress port.
-+Source lists are not used to narrow delivery, so a source-specific join may
-+receive traffic from more sources than requested but never fewer.
-+Records that only revoke interest, such as BLOCK_OLD_SOURCES or a
-+CHANGE_TO_INCLUDE_MODE record with an empty source list (the IGMPv3 leave),
-+never remove listener state immediately; state expires through aging, as with
-+an IGMPv2 leave.
- .Pp
- Member ports on which IGMP membership queries are seen are additionally
- learned as multicast-router ports.
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+index 47c96f316..53bf7a94a 100755
 --- a/tests/sys/net/if_bridge_test.sh
 +++ b/tests/sys/net/if_bridge_test.sh
-@@ -975,7 +975,46 @@
- CSRC
- 	cc -o /tmp/mcast_query_bridge_test /tmp/mcast_query_bridge_test.c || \
+@@ -981,6 +981,45 @@ CSRC
  	    atf_skip "could not compile mcast_query helper"
-+}
-+
+ }
+ 
 +# Compile a helper that performs an IGMPv3 source-specific join
 +# (IP_ADD_SOURCE_MEMBERSHIP) and holds the socket open.  On an IGMPv3 stack
 +# this makes the kernel emit INCLUDE-family group records rather than a
@@ -121,16 +136,17 @@
 +		return 1;
 +	sleep(secs);
 +	return 0;
- }
++}
 +CSRC
 +	cc -o /tmp/mcast_source_join_bridge_test \
 +	    /tmp/mcast_source_join_bridge_test.c || \
 +	    atf_skip "could not compile mcast_source_join helper"
 +}
- 
++
  atf_test_case "mdb_vnet_topology" "cleanup"
  mdb_vnet_topology_head()
-@@ -1254,6 +1293,95 @@
+ {
+@@ -1258,6 +1297,95 @@ mdb_router_forward_cleanup()
  	vnet_cleanup
  }
  
@@ -226,7 +242,7 @@
  atf_test_case "member_ifaddrs_enabled" "cleanup"
  member_ifaddrs_enabled_head()
  {
-@@ -1402,6 +1530,7 @@
+@@ -1946,6 +2074,7 @@ atf_init_test_cases()
  	atf_add_test_case "mdb_selective_forward"
  	atf_add_test_case "mdb_counters"
  	atf_add_test_case "mdb_router_forward"
@@ -234,3 +250,6 @@
  	atf_add_test_case "member_ifaddrs_enabled"
  	atf_add_test_case "member_ifaddrs_disabled"
  	atf_add_test_case "member_ifaddrs_vlan"
+-- 
+2.39.3 (Apple Git-145)
+

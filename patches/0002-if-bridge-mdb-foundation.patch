@@ -1,8 +1,19 @@
+From 50a945ed7f2d3750566ce90f9ef787f0e0e41efa Mon Sep 17 00:00:00 2001
+From: Khanh Nguyen <namkhanh052005@gmail.com>
+Date: Fri, 7 Aug 2026 15:00:55 +0700
+Subject: if_bridge: add multicast database (MDB) foundation
+
+---
+ sys/net/if_bridge.c             | 314 +++++++++++++++++++++++++++++++-
+ sys/net/if_bridgevar.h          |   3 +-
+ tests/sys/net/if_bridge_test.sh |  53 ++++++
+ 3 files changed, 367 insertions(+), 3 deletions(-)
+
 diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
-index 17d24141a..e76b92969 100644
+index 15def69f1..adebce153 100644
 --- a/sys/net/if_bridge.c
 +++ b/sys/net/if_bridge.c
-@@ -189,6 +189,13 @@
+@@ -192,6 +192,13 @@
  #define	BRIDGE_RTABLE_PRUNE_PERIOD	(5 * 60)
  #endif
  
@@ -16,7 +27,7 @@ index 17d24141a..e76b92969 100644
  /*
   * List of capabilities to possibly mask on the member interface.
   */
-@@ -210,7 +217,7 @@
+@@ -213,7 +220,7 @@
   * That is: for read accesses we only need to be in NET_EPOCH, but for write
   * accesses we must hold:
   *
@@ -25,7 +36,7 @@ index 17d24141a..e76b92969 100644
   *  - BRIDGE_LOCK, for any other change
   *
   * The BRIDGE_LOCK is a sleepable lock, because it is held across ioctl()
-@@ -269,6 +276,31 @@ struct bridge_rtnode {
+@@ -278,6 +285,31 @@ struct bridge_rtnode {
  };
  #define	brt_ifp			brt_dst->bif_ifp
  
@@ -57,7 +68,7 @@ index 17d24141a..e76b92969 100644
  /*
   * Software state for each bridge.
   */
-@@ -282,9 +314,13 @@ struct bridge_softc {
+@@ -291,9 +323,13 @@ struct bridge_softc {
  	uint32_t		sc_brtcnt;	/* cur. # of addresses */
  	uint32_t		sc_brttimeout;	/* rt timeout in seconds */
  	struct callout		sc_brcallout;	/* bridge callout */
@@ -71,15 +82,15 @@ index 17d24141a..e76b92969 100644
  	uint32_t		sc_rthash_key;	/* key for hash */
  	CK_LIST_HEAD(, bridge_iflist) sc_spanlist;	/* span ports list */
  	struct bstp_state	sc_stp;		/* STP state */
-@@ -335,6 +371,7 @@ static void	bridge_forward(struct bridge_softc *, struct bridge_iflist *,
+@@ -347,6 +383,7 @@ static void	bridge_forward(struct bridge_softc *, struct bridge_iflist *,
+ 		    struct mbuf *m);
  static bool	bridge_member_ifaddrs(void);
- 
  static void	bridge_timer(void *);
 +static void	bridge_mdb_timer(void *);
  
  static void	bridge_broadcast(struct bridge_softc *, struct ifnet *,
  		    struct mbuf *, int);
-@@ -352,6 +389,14 @@ static int	bridge_rtdaddr(struct bridge_softc *, const uint8_t *,
+@@ -367,6 +404,14 @@ static bool	bridge_vfilter_out(const struct bridge_iflist *,
  
  static void	bridge_rtable_init(struct bridge_softc *);
  static void	bridge_rtable_fini(struct bridge_softc *);
@@ -94,7 +105,7 @@ index 17d24141a..e76b92969 100644
  
  static int	bridge_rtnode_addr_cmp(const uint8_t *, const uint8_t *);
  static struct bridge_rtnode *bridge_rtnode_lookup(struct bridge_softc *,
-@@ -789,8 +834,10 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
+@@ -875,8 +920,10 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
  
  	/* Initialize our routing table. */
  	bridge_rtable_init(sc);
@@ -105,7 +116,7 @@ index 17d24141a..e76b92969 100644
  
  	CK_LIST_INIT(&sc->sc_iflist);
  	CK_LIST_INIT(&sc->sc_spanlist);
-@@ -852,6 +899,241 @@ bridge_rsvd_link_local_enabled(struct bridge_softc *sc, const uint8_t *dst)
+@@ -939,6 +986,241 @@ bridge_rsvd_link_local_enabled(struct bridge_softc *sc, const uint8_t *dst)
  	return ((sc->sc_group_fwd_mask & bit) != 0);
  }
  
@@ -347,8 +358,8 @@ index 17d24141a..e76b92969 100644
  static void
  bridge_clone_destroy_cb(struct epoch_context *ctx)
  {
-@@ -895,6 +1177,11 @@ bridge_clone_destroy(struct if_clone *ifc, struct ifnet *ifp, uint32_t flags)
- 	NET_EPOCH_ENTER(et);
+@@ -979,6 +1261,11 @@ bridge_clone_destroy(struct if_clone *ifc, struct ifnet *ifp, uint32_t flags)
+ 	BRIDGE_UNLOCK(sc);
  
  	callout_drain(&sc->sc_brcallout);
 +	callout_drain(&sc->sc_mdbcallout);
@@ -359,7 +370,7 @@ index 17d24141a..e76b92969 100644
  
  	BRIDGE_LIST_LOCK();
  	LIST_REMOVE(sc, sc_list);
-@@ -1222,6 +1509,7 @@ bridge_delete_member(struct bridge_softc *sc, struct bridge_iflist *bif,
+@@ -1306,6 +1593,7 @@ bridge_delete_member(struct bridge_softc *sc, struct bridge_iflist *bif,
  	bridge_linkcheck(sc);
  	bridge_mutecaps(sc);	/* recalcuate now this interface is removed */
  	BRIDGE_RT_LOCK(sc);
@@ -367,7 +378,7 @@ index 17d24141a..e76b92969 100644
  	bridge_rtdelete(sc, ifs, IFBF_FLUSHALL);
  	BRIDGE_RT_UNLOCK(sc);
  	KASSERT(bif->bif_addrcnt == 0,
-@@ -2113,6 +2401,8 @@ bridge_init(void *xsc)
+@@ -2376,6 +2664,8 @@ bridge_init(void *xsc)
  	BRIDGE_LOCK(sc);
  	callout_reset(&sc->sc_brcallout, bridge_rtable_prune_period * hz,
  	    bridge_timer, sc);
@@ -376,7 +387,7 @@ index 17d24141a..e76b92969 100644
  
  	ifp->if_drv_flags |= IFF_DRV_RUNNING;
  	bstp_init(&sc->sc_stp);		/* Initialize Spanning Tree */
-@@ -2137,6 +2427,7 @@ bridge_stop(struct ifnet *ifp, int disable)
+@@ -2400,6 +2690,7 @@ bridge_stop(struct ifnet *ifp)
  
  	BRIDGE_RT_LOCK(sc);
  	callout_stop(&sc->sc_brcallout);
@@ -384,7 +395,7 @@ index 17d24141a..e76b92969 100644
  
  	bstp_stop(&sc->sc_stp);
  
-@@ -3139,6 +3430,27 @@ bridge_timer(void *arg)
+@@ -3632,6 +3923,27 @@ bridge_timer(void *arg)
  	CURVNET_RESTORE();
  }
  
@@ -413,21 +424,10 @@ index 17d24141a..e76b92969 100644
   * bridge_rtage:
   *
 diff --git a/sys/net/if_bridgevar.h b/sys/net/if_bridgevar.h
-index 2fa9d8623..565400eb7 100644
+index c4c4b9f32..646468813 100644
 --- a/sys/net/if_bridgevar.h
 +++ b/sys/net/if_bridgevar.h
-@@ -122,8 +122,8 @@
- #define	BRDGSPROTO		28	/* set protocol (ifbrparam) */
- #define	BRDGSTXHC		29	/* set tx hold count (ifbrparam) */
- #define	BRDGSIFAMAX		30	/* set max interface addrs (ifbreq) */
--#define	BRDGGFWDMASK		31	/* get group_fwd_mask (ifbrparam) */
--#define	BRDGSFWDMASK		32	/* set group_fwd_mask (ifbrparam) */
-+#define	BRDGGFWDMASK	31	/* get group_fwd_mask (ifbrparam) */
-+#define	BRDGSFWDMASK	32	/* set group_fwd_mask (ifbrparam) */
- 
- /*
-  * Generic bridge control request.
-@@ -226,8 +226,7 @@ struct ifbrparam {
+@@ -247,8 +247,7 @@ struct ifbrparam {
  #define	ifbrp_csize	ifbrp_ifbrpu.ifbrpu_int32	/* cache size */
  #define	ifbrp_ctime	ifbrp_ifbrpu.ifbrpu_int32	/* cache time (sec) */
  #define	ifbrp_prio	ifbrp_ifbrpu.ifbrpu_int16	/* bridge priority */
@@ -438,10 +438,10 @@ index 2fa9d8623..565400eb7 100644
  #define	ifbrp_txhc	ifbrp_ifbrpu.ifbrpu_int8	/* bpdu tx holdcount */
  #define	ifbrp_hellotime	ifbrp_ifbrpu.ifbrpu_int8	/* hello time (sec) */
 diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
-index 99e5b41b6..6e693a646 100755
+index 31e2a3e8f..2ff9cb41a 100755
 --- a/tests/sys/net/if_bridge_test.sh
 +++ b/tests/sys/net/if_bridge_test.sh
-@@ -820,6 +820,58 @@ group_fwd_mask_cleanup()
+@@ -824,6 +824,58 @@ group_fwd_mask_cleanup()
  	vnet_cleanup
  }
  
@@ -500,7 +500,7 @@ index 99e5b41b6..6e693a646 100755
  atf_test_case "member_ifaddrs_enabled" "cleanup"
  member_ifaddrs_enabled_head()
  {
-@@ -963,6 +1015,7 @@ atf_init_test_cases()
+@@ -1507,6 +1559,7 @@ atf_init_test_cases()
  	atf_add_test_case "vlan"
  	atf_add_test_case "many_bridge_members"
  	atf_add_test_case "group_fwd_mask"
@@ -508,3 +508,6 @@ index 99e5b41b6..6e693a646 100755
  	atf_add_test_case "member_ifaddrs_enabled"
  	atf_add_test_case "member_ifaddrs_disabled"
  	atf_add_test_case "member_ifaddrs_vlan"
+-- 
+2.39.3 (Apple Git-145)
+

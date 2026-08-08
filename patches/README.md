@@ -1,5 +1,12 @@
 # Patches
 
+As of 2026-08-08, these are generated against FreeBSD `main` (rebased from
+the `stable/14` base the series was originally developed and VM-tested
+against). See `docs/main-rebase-verification.md` for the rebase itself and
+`docs/phabricator-submission-guide.md` for the upstream submission
+process. All 8 apply cleanly in order via `patch --batch --forward -p1`
+against a fresh `main` checkout.
+
 - `0001-if-bridge-group-fwd-mask.patch`: Deliverable 1 patch for FreeBSD `if_bridge(4)`.
 - `0002-if-bridge-mdb-foundation.patch`: Incremental MDB structures, cleanup callout scaffolding, and VNET topology test patch. Apply after `0001`.
 - `0003-if-bridge-ipv4-igmp-learning.patch`: Incremental IPv4 IGMP listener learning and unknown multicast flood fallback test. Apply after `0002`.

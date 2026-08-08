@@ -1,17 +1,32 @@
+From 7971c1802b61ff8cd268af94e5366ac2eaaf3506 Mon Sep 17 00:00:00 2001
+From: Khanh Nguyen <namkhanh052005@gmail.com>
+Date: Fri, 7 Aug 2026 15:00:55 +0700
+Subject: if_bridge: add group_fwd_mask ioctl for reserved link-local multicast
+
+---
+ lib/libifconfig/libifconfig.h        |  1 +
+ lib/libifconfig/libifconfig_bridge.c |  7 ++++
+ sbin/ifconfig/ifbridge.c             | 17 +++++++++
+ share/man/man4/bridge.4              | 22 ++++++++++++
+ sys/net/if_bridge.c                  | 53 +++++++++++++++++++++++++---
+ sys/net/if_bridgevar.h               |  4 +++
+ tests/sys/net/if_bridge_test.sh      | 32 +++++++++++++++++
+ 7 files changed, 131 insertions(+), 5 deletions(-)
+
 diff --git a/lib/libifconfig/libifconfig.h b/lib/libifconfig/libifconfig.h
-index 03a0d0b19..96228926b 100644
+index 817f52bd0..aaa28d287 100644
 --- a/lib/libifconfig/libifconfig.h
 +++ b/lib/libifconfig/libifconfig.h
-@@ -67,6 +67,7 @@ struct ifconfig_bridge_status {
- 	size_t members_count;		/**< how many member interfaces */
- 	uint32_t cache_size;		/**< size of address cache */
+@@ -73,6 +73,7 @@ struct ifconfig_bridge_status {
  	uint32_t cache_lifetime;	/**< address cache entry lifetime */
+ 	ifbr_flags_t flags;		/**< bridge flags */
+ 	ether_vlanid_t defpvid;		/**< default pvid */
 +	uint16_t group_fwd_mask;	/**< link-local reserved group mask */
  };
  
  struct ifconfig_capabilities {
 diff --git a/lib/libifconfig/libifconfig_bridge.c b/lib/libifconfig/libifconfig_bridge.c
-index 2a9bbc358..fdf71c8f8 100644
+index 2bb2952ae..67c1956b5 100644
 --- a/lib/libifconfig/libifconfig_bridge.c
 +++ b/lib/libifconfig/libifconfig_bridge.c
 @@ -66,6 +66,7 @@ ifconfig_bridge_get_bridge_status(ifconfig_handle_t *h,
@@ -19,28 +34,27 @@ index 2a9bbc358..fdf71c8f8 100644
  	struct ifbifconf members;
  	struct ifbrparam cache_param;
 +	struct ifbrparam fwd_mask_param;
- 	struct _ifconfig_bridge_status *bridge;
- 	char *buf;
+ 	struct _ifconfig_bridge_status *bridge = NULL;
+ 	char *buf = NULL;
  
-@@ -93,6 +94,13 @@ ifconfig_bridge_get_bridge_status(ifconfig_handle_t *h,
+@@ -104,6 +105,12 @@ ifconfig_bridge_get_bridge_status(ifconfig_handle_t *h,
  	}
- 	bridge->inner.cache_lifetime = cache_param.ifbrp_ctime;
+ 	bridge->inner.defpvid = cache_param.ifbrp_defpvid;
  
 +	if (ifconfig_bridge_ioctlwrap(h, name, BRDGGFWDMASK,
 +	    &fwd_mask_param, sizeof(fwd_mask_param), false) != 0) {
-+		free(bridge);
-+		return (-1);
++		goto err;
 +	}
 +	bridge->inner.group_fwd_mask = fwd_mask_param.ifbrp_group_fwd_mask;
 +
  	if (ifconfig_bridge_ioctlwrap(h, name, BRDGPARAM,
  	    &bridge->params, sizeof(bridge->params), false) != 0) {
- 		free(bridge);
+ 		goto err;
 diff --git a/sbin/ifconfig/ifbridge.c b/sbin/ifconfig/ifbridge.c
-index 9d3296ea6..4e0677fb8 100644
+index 8bcf4a638..6797a85ab 100644
 --- a/sbin/ifconfig/ifbridge.c
 +++ b/sbin/ifconfig/ifbridge.c
-@@ -186,6 +186,7 @@ bridge_status(if_ctx *ctx)
+@@ -235,6 +235,7 @@ bridge_status(if_ctx *ctx)
  	    stpproto[params->ifbop_protocol],
  	    bridge->cache_size,
  	    bridge->cache_lifetime);
@@ -48,7 +62,7 @@ index 9d3296ea6..4e0677fb8 100644
  	PV2ID(params->ifbop_designated_root, bprio, lladdr);
  	printf("\troot id %s priority %d ifcost %u port %u\n",
  	    ether_ntoa((struct ether_addr *)lladdr),
-@@ -660,6 +661,21 @@ setbridge_timeout(if_ctx *ctx, const char *arg, int dummy __unused)
+@@ -796,6 +797,21 @@ setbridge_timeout(if_ctx *ctx, const char *arg, int dummy __unused)
  		err(1, "BRDGSTO %s",  arg);
  }
  
@@ -70,16 +84,16 @@ index 9d3296ea6..4e0677fb8 100644
  static void
  setbridge_private(if_ctx *ctx, const char *val, int dummy __unused)
  {
-@@ -711,6 +727,7 @@ static struct cmd bridge_cmds[] = {
- 	DEF_CMD_ARG2("ifpathcost",	setbridge_ifpathcost),
- 	DEF_CMD_ARG2("ifmaxaddr",	setbridge_ifmaxaddr),
+@@ -1028,6 +1044,7 @@ static struct cmd bridge_cmds[] = {
+ 	DEF_CMD_ARG2("-iftagged",	delbridge_iftagged),
+ 	DEF_CMD_ARG2("ifvlanproto",	setbridge_ifvlanproto),
  	DEF_CMD_ARG("timeout",		setbridge_timeout),
 +	DEF_CMD_ARG("group_fwd_mask",	setbridge_group_fwd_mask),
  	DEF_CMD_ARG("private",		setbridge_private),
  	DEF_CMD_ARG("-private",		unsetbridge_private),
- };
+ 	DEF_CMD("vlanfilter", (int32_t)IFBRF_VLANFILTER,
 diff --git a/share/man/man4/bridge.4 b/share/man/man4/bridge.4
-index da47ba62b..7e44c3773 100644
+index 3d10b06c0..b2726236c 100644
 --- a/share/man/man4/bridge.4
 +++ b/share/man/man4/bridge.4
 @@ -121,6 +121,28 @@ interfaces that are part of the bridge.
@@ -112,10 +126,10 @@ index da47ba62b..7e44c3773 100644
  .Xr syslog 3 .
  This behavior can be disabled by setting the
 diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
-index 0f4ec01fb..17d24141a 100644
+index 792b2c952..15def69f1 100644
 --- a/sys/net/if_bridge.c
 +++ b/sys/net/if_bridge.c
-@@ -277,6 +277,7 @@ struct bridge_softc {
+@@ -286,6 +286,7 @@ struct bridge_softc {
  	LIST_ENTRY(bridge_softc) sc_list;
  	struct sx		sc_sx;
  	struct mtx		sc_rt_mtx;
@@ -123,16 +137,16 @@ index 0f4ec01fb..17d24141a 100644
  	uint32_t		sc_brtmax;	/* max # of addresses */
  	uint32_t		sc_brtcnt;	/* cur. # of addresses */
  	uint32_t		sc_brttimeout;	/* rt timeout in seconds */
-@@ -402,6 +403,8 @@ static int	bridge_ioctl_grte(struct bridge_softc *, void *);
- static int	bridge_ioctl_gifsstp(struct bridge_softc *, void *);
- static int	bridge_ioctl_sproto(struct bridge_softc *, void *);
- static int	bridge_ioctl_stxhc(struct bridge_softc *, void *);
+@@ -425,6 +426,8 @@ static int	bridge_ioctl_sflags(struct bridge_softc *, void *);
+ static int	bridge_ioctl_gdefpvid(struct bridge_softc *, void *);
+ static int	bridge_ioctl_sdefpvid(struct bridge_softc *, void *);
+ static int	bridge_ioctl_svlanproto(struct bridge_softc *, void *);
 +static int	bridge_ioctl_gfwdmask(struct bridge_softc *, void *);
 +static int	bridge_ioctl_sfwdmask(struct bridge_softc *, void *);
  static int	bridge_pfil(struct mbuf **, struct ifnet *, struct ifnet *,
  		    int);
  #ifdef INET
-@@ -414,6 +417,8 @@ static int	bridge_ip6_checkbasic(struct mbuf **mp);
+@@ -437,6 +440,8 @@ static int	bridge_ip6_checkbasic(struct mbuf **mp);
  #endif /* INET6 */
  static void	bridge_linkstate(struct ifnet *ifp);
  static void	bridge_linkcheck(struct bridge_softc *sc);
@@ -141,10 +155,11 @@ index 0f4ec01fb..17d24141a 100644
  
  /*
   * Use the "null" value from IEEE 802.1Q-2014 Table 9-2
-@@ -613,6 +618,12 @@ static const struct bridge_control bridge_control_table[] = {
- 	{ bridge_ioctl_sifmaxaddr,	sizeof(struct ifbreq),
- 	  BC_F_COPYIN|BC_F_SUSER },
+@@ -659,6 +664,13 @@ static const struct bridge_control bridge_control_table[] = {
  
+ 	{ bridge_ioctl_svlanproto,	sizeof(struct ifbreq),
+ 	  BC_F_COPYIN|BC_F_SUSER },
++
 +	{ bridge_ioctl_gfwdmask,	sizeof(struct ifbrparam),
 +	  BC_F_COPYOUT },
 +
@@ -154,7 +169,7 @@ index 0f4ec01fb..17d24141a 100644
  };
  static const int bridge_control_table_size = nitems(bridge_control_table);
  
-@@ -772,6 +783,7 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
+@@ -857,6 +869,7 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
  	ifp = sc->sc_ifp = if_alloc(IFT_ETHER);
  
  	BRIDGE_LOCK_INIT(sc);
@@ -162,7 +177,7 @@ index 0f4ec01fb..17d24141a 100644
  	sc->sc_brtmax = BRIDGE_RTABLE_MAX;
  	sc->sc_brttimeout = BRIDGE_RTABLE_TIMEOUT;
  
-@@ -827,6 +839,19 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
+@@ -913,6 +926,19 @@ bridge_clone_create(struct if_clone *ifc, char *name, size_t len,
  	return (0);
  }
  
@@ -182,8 +197,8 @@ index 0f4ec01fb..17d24141a 100644
  static void
  bridge_clone_destroy_cb(struct epoch_context *ctx)
  {
-@@ -2005,6 +2030,24 @@ bridge_ioctl_stxhc(struct bridge_softc *sc, void *arg)
- 	return (bstp_set_holdcount(&sc->sc_stp, param->ifbrp_txhc));
+@@ -2219,6 +2245,15 @@ bridge_ioctl_gflags(struct bridge_softc *sc, void *arg)
+ 	return (0);
  }
  
 +static int
@@ -195,7 +210,13 @@ index 0f4ec01fb..17d24141a 100644
 +	return (0);
 +}
 +
-+static int
+ static int
+ bridge_ioctl_sflags(struct bridge_softc *sc, void *arg)
+ {
+@@ -2271,6 +2306,14 @@ bridge_ioctl_svlanproto(struct bridge_softc *sc, void *arg)
+ 
+ 	return (0);
+ }
 +bridge_ioctl_sfwdmask(struct bridge_softc *sc, void *arg)
 +{
 +	struct ifbrparam *param = arg;
@@ -207,7 +228,7 @@ index 0f4ec01fb..17d24141a 100644
  /*
   * bridge_ifdetach:
   *
-@@ -2461,12 +2504,12 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+@@ -2761,12 +2804,12 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
  			goto drop;
  	} else {
  		/*
@@ -226,19 +247,19 @@ index 0f4ec01fb..17d24141a 100644
  		    dst[4] == 0x00 && dst[5] <= 0x0f)
  			goto drop;
 diff --git a/sys/net/if_bridgevar.h b/sys/net/if_bridgevar.h
-index 511ca7538..2fa9d8623 100644
+index 5ed8c19f3..c4c4b9f32 100644
 --- a/sys/net/if_bridgevar.h
 +++ b/sys/net/if_bridgevar.h
-@@ -122,6 +122,8 @@
- #define	BRDGSPROTO		28	/* set protocol (ifbrparam) */
- #define	BRDGSTXHC		29	/* set tx hold count (ifbrparam) */
- #define	BRDGSIFAMAX		30	/* set max interface addrs (ifbreq) */
-+#define	BRDGGFWDMASK		31	/* get group_fwd_mask (ifbrparam) */
-+#define	BRDGSFWDMASK		32	/* set group_fwd_mask (ifbrparam) */
+@@ -132,6 +132,8 @@
+ #define	BRDGGDEFPVID		36	/* get default pvid (ifbrparam) */
+ #define	BRDGSDEFPVID		37	/* set default pvid (ifbrparam) */
+ #define	BRDGSIFVLANPROTO	38	/* set if vlan protocol (ifbreq) */
++#define	BRDGGFWDMASK		39	/* get group_fwd_mask (ifbrparam) */
++#define	BRDGSFWDMASK		40	/* set group_fwd_mask (ifbrparam) */
  
- /*
-  * Generic bridge control request.
-@@ -224,6 +226,8 @@ struct ifbrparam {
+ /* BRDGSFLAGS, Bridge flags (non-interface-specific) */
+ typedef uint32_t ifbr_flags_t;
+@@ -245,6 +247,8 @@ struct ifbrparam {
  #define	ifbrp_csize	ifbrp_ifbrpu.ifbrpu_int32	/* cache size */
  #define	ifbrp_ctime	ifbrp_ifbrpu.ifbrpu_int32	/* cache time (sec) */
  #define	ifbrp_prio	ifbrp_ifbrpu.ifbrpu_int16	/* bridge priority */
@@ -248,10 +269,10 @@ index 511ca7538..2fa9d8623 100644
  #define	ifbrp_txhc	ifbrp_ifbrpu.ifbrpu_int8	/* bpdu tx holdcount */
  #define	ifbrp_hellotime	ifbrp_ifbrpu.ifbrpu_int8	/* hello time (sec) */
 diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
-index 8fe3c4ac7..99e5b41b6 100755
+index 4b9293514..31e2a3e8f 100755
 --- a/tests/sys/net/if_bridge_test.sh
 +++ b/tests/sys/net/if_bridge_test.sh
-@@ -789,6 +789,37 @@ many_bridge_members_cleanup()
+@@ -793,6 +793,37 @@ many_bridge_members_cleanup()
  	vnet_cleanup
  }
  
@@ -289,7 +310,7 @@ index 8fe3c4ac7..99e5b41b6 100755
  atf_test_case "member_ifaddrs_enabled" "cleanup"
  member_ifaddrs_enabled_head()
  {
-@@ -931,6 +962,7 @@ atf_init_test_cases()
+@@ -1475,6 +1506,7 @@ atf_init_test_cases()
  	atf_add_test_case "mtu"
  	atf_add_test_case "vlan"
  	atf_add_test_case "many_bridge_members"
@@ -297,3 +318,6 @@ index 8fe3c4ac7..99e5b41b6 100755
  	atf_add_test_case "member_ifaddrs_enabled"
  	atf_add_test_case "member_ifaddrs_disabled"
  	atf_add_test_case "member_ifaddrs_vlan"
+-- 
+2.39.3 (Apple Git-145)
+

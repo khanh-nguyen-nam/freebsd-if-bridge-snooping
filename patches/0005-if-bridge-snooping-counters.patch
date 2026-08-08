@@ -1,8 +1,19 @@
+From 9ff89868a1f106e95b62e408816644430076f109 Mon Sep 17 00:00:00 2001
+From: Khanh Nguyen <namkhanh052005@gmail.com>
+Date: Fri, 7 Aug 2026 15:00:56 +0700
+Subject: if_bridge: add igmp_snooping enable knob and MDB counters
+
+---
+ share/man/man4/bridge.4         |  42 ++++++++++
+ sys/net/if_bridge.c             |  87 ++++++++++++++++++--
+ tests/sys/net/if_bridge_test.sh | 137 ++++++++++++++++++++++++--------
+ 3 files changed, 228 insertions(+), 38 deletions(-)
+
 diff --git a/share/man/man4/bridge.4 b/share/man/man4/bridge.4
-index 7e44c3773..f0ee4c894 100644
+index b2726236c..b103e61c8 100644
 --- a/share/man/man4/bridge.4
 +++ b/share/man/man4/bridge.4
-@@ -455,6 +455,48 @@ interface and not to the bridge members.
+@@ -605,6 +605,48 @@ interface and not to the bridge members.
  Enabling
  .Va net.link.bridge.pfil_local_phys
  will let you do the additional filtering on the physical interface.
@@ -52,18 +63,18 @@ index 7e44c3773..f0ee4c894 100644
  .Xr netmap 4
  applications may open a bridge interface in emulated mode.
 diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
-index 2fb98424a..29d6e9921 100644
+index d8332dd2f..6df2a5189 100644
 --- a/sys/net/if_bridge.c
 +++ b/sys/net/if_bridge.c
-@@ -90,6 +90,7 @@
- #include <sys/time.h>
- #include <sys/socket.h> /* for net/if.h */
- #include <sys/sockio.h>
+@@ -82,6 +82,7 @@
+ #define	EXTERR_CATEGORY	EXTERR_CAT_BRIDGE
+ 
+ #include <sys/param.h>
 +#include <sys/counter.h>
  #include <sys/ctype.h>  /* string functions */
- #include <sys/kernel.h>
- #include <sys/random.h>
-@@ -585,6 +586,53 @@ bridge_member_ifaddrs(void)
+ #include <sys/eventhandler.h>
+ #include <sys/exterrvar.h>
+@@ -608,6 +609,53 @@ bridge_member_ifaddrs(void)
  	return (V_member_ifaddrs);
  }
  
@@ -117,7 +128,7 @@ index 2fb98424a..29d6e9921 100644
  VNET_DEFINE_STATIC(int, log_interval) = 5;
  VNET_DEFINE_STATIC(int, log_count) = 0;
  VNET_DEFINE_STATIC(struct timeval, log_last) = { 0 };
-@@ -719,6 +766,12 @@ vnet_bridge_init(const void *unused __unused)
+@@ -766,6 +814,12 @@ vnet_bridge_init(const void *unused __unused)
  	    UMA_ALIGN_PTR, 0);
  	BRIDGE_LIST_LOCK_INIT();
  
@@ -130,7 +141,7 @@ index 2fb98424a..29d6e9921 100644
  	struct if_clone_addreq req = {
  		.create_f = bridge_clone_create,
  		.destroy_f = bridge_clone_destroy,
-@@ -741,6 +794,12 @@ vnet_bridge_uninit(const void *unused __unused)
+@@ -788,6 +842,12 @@ vnet_bridge_uninit(const void *unused __unused)
  	NET_EPOCH_DRAIN_CALLBACKS();
  
  	uma_zdestroy(V_bridge_rtnode_zone);
@@ -143,7 +154,7 @@ index 2fb98424a..29d6e9921 100644
  }
  VNET_SYSUNINIT(vnet_bridge_uninit, SI_SUB_PSEUDO, SI_ORDER_ANY,
      vnet_bridge_uninit, NULL);
-@@ -1046,6 +1105,7 @@ bridge_mdb_destroy_entry(struct bridge_softc *sc, struct bridge_mdb_entry *bmd)
+@@ -1133,6 +1193,7 @@ bridge_mdb_destroy_entry(struct bridge_softc *sc, struct bridge_mdb_entry *bmd)
  
  	CK_LIST_REMOVE(bmd, bmd_next);
  	sc->sc_mdbcnt--;
@@ -151,7 +162,7 @@ index 2fb98424a..29d6e9921 100644
  	NET_EPOCH_CALL(bridge_mdb_destroy_entry_cb, &bmd->bmd_epoch_ctx);
  }
  
-@@ -1064,6 +1124,7 @@ bridge_mdb_remove_member(struct bridge_softc *sc, struct bridge_mdb_entry *bmd,
+@@ -1151,6 +1212,7 @@ bridge_mdb_remove_member(struct bridge_softc *sc, struct bridge_mdb_entry *bmd,
  
  	CK_LIST_REMOVE(bmd, bmd_next);
  	sc->sc_mdbcnt--;
@@ -159,7 +170,7 @@ index 2fb98424a..29d6e9921 100644
  	NET_EPOCH_CALL(bridge_mdb_destroy_entry_cb, &bmd->bmd_epoch_ctx);
  	return (true);
  }
-@@ -1105,6 +1166,7 @@ bridge_mdb_add_member(struct bridge_softc *sc, sa_family_t family,
+@@ -1192,6 +1254,7 @@ bridge_mdb_add_member(struct bridge_softc *sc, sa_family_t family,
  		new_bmd = NULL;
  		CK_LIST_INSERT_HEAD(&sc->sc_mdb, bmd, bmd_next);
  		sc->sc_mdbcnt++;
@@ -167,7 +178,7 @@ index 2fb98424a..29d6e9921 100644
  		created_bmd = true;
  	}
  
-@@ -1171,7 +1233,8 @@ bridge_mdb_input(struct bridge_softc *sc, struct bridge_iflist *bif,
+@@ -1258,7 +1321,8 @@ bridge_mdb_input(struct bridge_softc *sc, struct bridge_iflist *bif,
  	if (ether_type != ETHERTYPE_IP)
  		return;
  
@@ -177,7 +188,7 @@ index 2fb98424a..29d6e9921 100644
  }
  
  static int
-@@ -1364,8 +1427,14 @@ bridge_mdb_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+@@ -1451,8 +1515,14 @@ bridge_mdb_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
  	 * either BRIDGE_RT_LOCK or an active net epoch for readers.
  	 */
  	bmd = bridge_mdb_lookup(sc, &key);
@@ -193,7 +204,7 @@ index 2fb98424a..29d6e9921 100644
  
  	/*
  	 * Run the bridge-level output filter once before replicating.
-@@ -1489,9 +1558,11 @@ bridge_mdb_prune(struct bridge_softc *sc)
+@@ -1576,9 +1646,11 @@ bridge_mdb_prune(struct bridge_softc *sc)
  
  	CK_LIST_FOREACH_SAFE(bmd, &sc->sc_mdb, bmd_next, nbmd) {
  		CK_LIST_FOREACH_SAFE(bmm, &bmd->bmd_members, bmm_next, nbmm) {
@@ -208,7 +219,7 @@ index 2fb98424a..29d6e9921 100644
  				break;
  		}
  	}
-@@ -3186,7 +3257,8 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+@@ -3486,7 +3558,8 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
  		if_inc_counter(ifp, IFCOUNTER_IMCASTS, 1);
  		dst_if = NULL;
  #ifdef INET
@@ -218,7 +229,7 @@ index 2fb98424a..29d6e9921 100644
  #endif
  	}
  
-@@ -3212,7 +3284,7 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+@@ -3512,7 +3585,7 @@ bridge_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
  
  	if (dst_if == NULL) {
  #ifdef INET
@@ -228,10 +239,10 @@ index 2fb98424a..29d6e9921 100644
  #endif
  		bridge_broadcast(sc, src_if, m, 1);
 diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
-index 157b967ec..b65334ff5 100755
+index 24a8f147e..dc9912aa1 100755
 --- a/tests/sys/net/if_bridge_test.sh
 +++ b/tests/sys/net/if_bridge_test.sh
-@@ -845,6 +845,41 @@ bridge_mdb_vnet_topology_create()
+@@ -849,6 +849,41 @@ bridge_mdb_vnet_topology_create()
  	ifconfig ${mdb_bridge} addm ${mdb_idle_epair}a
  }
  
@@ -273,7 +284,7 @@ index 157b967ec..b65334ff5 100755
  atf_test_case "mdb_vnet_topology" "cleanup"
  mdb_vnet_topology_head()
  {
-@@ -887,6 +922,12 @@ mdb_unknown_multicast_flood_body()
+@@ -891,6 +926,12 @@ mdb_unknown_multicast_flood_body()
  
  	bridge_mdb_vnet_topology_create
  
@@ -286,7 +297,7 @@ index 157b967ec..b65334ff5 100755
  	capture="${PWD}/mdb_unknown_multicast_flood.tcpdump"
  	rm -f "${capture}"
  
-@@ -928,37 +969,12 @@ mdb_selective_forward_body()
+@@ -932,37 +973,12 @@ mdb_selective_forward_body()
  
  	bridge_mdb_vnet_topology_create
  
@@ -330,7 +341,7 @@ index 157b967ec..b65334ff5 100755
  
  	# Join 239.1.1.1 from the listener jail.  The kernel sends an IGMP
  	# membership report which the bridge learns via bridge_mdb_input().
-@@ -1000,6 +1016,64 @@ mdb_selective_forward_cleanup()
+@@ -1004,6 +1020,64 @@ mdb_selective_forward_cleanup()
  	vnet_cleanup
  }
  
@@ -395,7 +406,7 @@ index 157b967ec..b65334ff5 100755
  atf_test_case "member_ifaddrs_enabled" "cleanup"
  member_ifaddrs_enabled_head()
  {
-@@ -1146,6 +1220,7 @@ atf_init_test_cases()
+@@ -1690,6 +1764,7 @@ atf_init_test_cases()
  	atf_add_test_case "mdb_vnet_topology"
  	atf_add_test_case "mdb_unknown_multicast_flood"
  	atf_add_test_case "mdb_selective_forward"
@@ -403,3 +414,6 @@ index 157b967ec..b65334ff5 100755
  	atf_add_test_case "member_ifaddrs_enabled"
  	atf_add_test_case "member_ifaddrs_disabled"
  	atf_add_test_case "member_ifaddrs_vlan"
+-- 
+2.39.3 (Apple Git-145)
+

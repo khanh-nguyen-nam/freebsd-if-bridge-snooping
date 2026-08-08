@@ -1,70 +1,19 @@
---- a/sys/net/if_bridge.c
-+++ b/sys/net/if_bridge.c
-@@ -1320,6 +1320,25 @@
- bridge_mdb_igmp_group_valid(struct in_addr group)
- {
- 	return (IN_MULTICAST(ntohl(group.s_addr)));
-+}
-+
-+/*
-+ * Whether listener state may be learned for a group.  RFC 4541 section
-+ * 2.1.1 requires that traffic addressed to the link-local 224.0.0.0/24
-+ * block always be forwarded on all ports, so membership in those groups is
-+ * never recorded.  Learning them would let one reporting host cause the
-+ * bridge to prune link-local control protocols -- mDNS on 224.0.0.251, OSPF
-+ * on 224.0.0.5 and 224.0.0.6 -- away from ports whose own reports were
-+ * suppressed by IGMP report suppression.  This is reachable in practice:
-+ * FreeBSD reports these groups by default (net.inet.igmp.sendlocal=1).
-+ *
-+ * A report for such a group is well-formed, just not actionable, so callers
-+ * treat it as accepted-with-no-effect rather than as a parse rejection.
-+ */
-+static bool
-+bridge_mdb_igmp_group_snoopable(struct in_addr group)
-+{
-+	return (!IN_LOCAL_GROUP(ntohl(group.s_addr)));
- }
- 
- static void
-@@ -1412,6 +1431,8 @@
- 		    !bridge_mdb_igmp_group_valid(igmp.igmp_group) ||
- 		    !in_hosteq(igmp.igmp_group, ip.ip_dst))
- 			return (EINVAL);
-+		if (!bridge_mdb_igmp_group_snoopable(igmp.igmp_group))
-+			return (0);
- 		return (bridge_mdb_add_member(sc, AF_INET, &igmp.igmp_group,
- 		    vlan, bif, BRIDGE_MDB_IGMP_MAXAGE));
- 	case IGMP_HOST_LEAVE_MESSAGE:
-@@ -1462,7 +1483,8 @@
- 				return (EINVAL);
- 
- 			if (pass == 1 &&
--			    bridge_mdb_igmp_group_valid(rec.ig_group)) {
-+			    bridge_mdb_igmp_group_valid(rec.ig_group) &&
-+			    bridge_mdb_igmp_group_snoopable(rec.ig_group)) {
- 				/*
- 				 * Reduce each record conservatively to ASM
- 				 * (*,G) listener state.  Any record that
-@@ -1651,6 +1673,16 @@
- 	m_copydata(m, ipoff, sizeof(ip), (caddr_t)&ip);
- 
- 	if (!IN_MULTICAST(ntohl(ip.ip_dst.s_addr)))
-+		return (false);
-+
-+	/*
-+	 * Never prune the link-local 224.0.0.0/24 block (RFC 4541 2.1.1):
-+	 * flood it exactly as the bridge did before snooping existed.
-+	 * Learning already refuses these groups, but checking on the
-+	 * forwarding side too means listener state recorded by an earlier
-+	 * kernel cannot prune control traffic after an upgrade.
-+	 */
-+	if (IN_LOCAL_GROUP(ntohl(ip.ip_dst.s_addr)))
- 		return (false);
- 
- 	if (bridge_mdb_key_init(&key, AF_INET, &ip.ip_dst, vlan) != 0)
+From 5326a6e706c6ae3a8870925f8137ad58331b87a9 Mon Sep 17 00:00:00 2001
+From: Khanh Nguyen <namkhanh052005@gmail.com>
+Date: Fri, 7 Aug 2026 15:00:58 +0700
+Subject: if_bridge: exempt 224.0.0.0/24 from IGMP snooping
+
+---
+ share/man/man4/bridge.4         | 13 +++++++
+ sys/net/if_bridge.c             | 34 +++++++++++++++++-
+ tests/sys/net/if_bridge_test.sh | 62 +++++++++++++++++++++++++++++++++
+ 3 files changed, 108 insertions(+), 1 deletion(-)
+
+diff --git a/share/man/man4/bridge.4 b/share/man/man4/bridge.4
+index 0298a3f50..f21e1d90f 100644
 --- a/share/man/man4/bridge.4
 +++ b/share/man/man4/bridge.4
-@@ -465,6 +465,19 @@
+@@ -615,6 +615,19 @@ This is disabled by default; forwarding falls back to flooding whenever no
  listener state is known, for non-IP multicast, and for exempt link-local
  control traffic.
  .Pp
@@ -84,15 +33,80 @@
  IGMPv3 group records are reduced conservatively to any-source
  .Pq (*,G)
  listener state.
---- a/tests/sys/net/if_bridge_test.sh
-+++ b/tests/sys/net/if_bridge_test.sh
-@@ -1379,6 +1379,67 @@
- {
- 	rm -f /tmp/mcast_source_join_bridge_test \
- 	    /tmp/mcast_source_join_bridge_test.c
-+	vnet_cleanup
+diff --git a/sys/net/if_bridge.c b/sys/net/if_bridge.c
+index 1b6304a5b..63ca17f31 100644
+--- a/sys/net/if_bridge.c
++++ b/sys/net/if_bridge.c
+@@ -1409,6 +1409,25 @@ bridge_mdb_igmp_group_valid(struct in_addr group)
+ 	return (IN_MULTICAST(ntohl(group.s_addr)));
+ }
+ 
++/*
++ * Whether listener state may be learned for a group.  RFC 4541 section
++ * 2.1.1 requires that traffic addressed to the link-local 224.0.0.0/24
++ * block always be forwarded on all ports, so membership in those groups is
++ * never recorded.  Learning them would let one reporting host cause the
++ * bridge to prune link-local control protocols -- mDNS on 224.0.0.251, OSPF
++ * on 224.0.0.5 and 224.0.0.6 -- away from ports whose own reports were
++ * suppressed by IGMP report suppression.  This is reachable in practice:
++ * FreeBSD reports these groups by default (net.inet.igmp.sendlocal=1).
++ *
++ * A report for such a group is well-formed, just not actionable, so callers
++ * treat it as accepted-with-no-effect rather than as a parse rejection.
++ */
++static bool
++bridge_mdb_igmp_group_snoopable(struct in_addr group)
++{
++	return (!IN_LOCAL_GROUP(ntohl(group.s_addr)));
 +}
 +
+ static void
+ bridge_mdb_input(struct bridge_softc *sc, struct bridge_iflist *bif,
+     struct mbuf *m)
+@@ -1499,6 +1518,8 @@ bridge_mdb_learn_igmp(struct bridge_softc *sc, struct bridge_iflist *bif,
+ 		    !bridge_mdb_igmp_group_valid(igmp.igmp_group) ||
+ 		    !in_hosteq(igmp.igmp_group, ip.ip_dst))
+ 			return (EINVAL);
++		if (!bridge_mdb_igmp_group_snoopable(igmp.igmp_group))
++			return (0);
+ 		return (bridge_mdb_add_member(sc, AF_INET, &igmp.igmp_group,
+ 		    vlan, bif, BRIDGE_MDB_IGMP_MAXAGE));
+ 	case IGMP_HOST_LEAVE_MESSAGE:
+@@ -1549,7 +1570,8 @@ bridge_mdb_igmp_v3_report(struct bridge_softc *sc, struct bridge_iflist *bif,
+ 				return (EINVAL);
+ 
+ 			if (pass == 1 &&
+-			    bridge_mdb_igmp_group_valid(rec.ig_group)) {
++			    bridge_mdb_igmp_group_valid(rec.ig_group) &&
++			    bridge_mdb_igmp_group_snoopable(rec.ig_group)) {
+ 				/*
+ 				 * Reduce each record conservatively to ASM
+ 				 * (*,G) listener state.  Any record that
+@@ -1740,6 +1762,16 @@ bridge_mdb_forward(struct bridge_softc *sc, struct bridge_iflist *sbif,
+ 	if (!IN_MULTICAST(ntohl(ip.ip_dst.s_addr)))
+ 		return (false);
+ 
++	/*
++	 * Never prune the link-local 224.0.0.0/24 block (RFC 4541 2.1.1):
++	 * flood it exactly as the bridge did before snooping existed.
++	 * Learning already refuses these groups, but checking on the
++	 * forwarding side too means listener state recorded by an earlier
++	 * kernel cannot prune control traffic after an upgrade.
++	 */
++	if (IN_LOCAL_GROUP(ntohl(ip.ip_dst.s_addr)))
++		return (false);
++
+ 	if (bridge_mdb_key_init(&key, AF_INET, &ip.ip_dst, vlan) != 0)
+ 		return (false);
+ 
+diff --git a/tests/sys/net/if_bridge_test.sh b/tests/sys/net/if_bridge_test.sh
+index 53bf7a94a..919888d66 100755
+--- a/tests/sys/net/if_bridge_test.sh
++++ b/tests/sys/net/if_bridge_test.sh
+@@ -1386,6 +1386,67 @@ mdb_igmpv3_source_join_cleanup()
+ 	vnet_cleanup
+ }
+ 
 +atf_test_case "mdb_link_local_exempt" "cleanup"
 +mdb_link_local_exempt_head()
 +{
@@ -151,10 +165,13 @@
 +mdb_link_local_exempt_cleanup()
 +{
 +	rm -f /tmp/mcast_join_bridge_test /tmp/mcast_join_bridge_test.c
- 	vnet_cleanup
- }
- 
-@@ -1531,6 +1592,7 @@
++	vnet_cleanup
++}
++
+ atf_test_case "member_ifaddrs_enabled" "cleanup"
+ member_ifaddrs_enabled_head()
+ {
+@@ -2075,6 +2136,7 @@ atf_init_test_cases()
  	atf_add_test_case "mdb_counters"
  	atf_add_test_case "mdb_router_forward"
  	atf_add_test_case "mdb_igmpv3_source_join"
@@ -162,3 +179,6 @@
  	atf_add_test_case "member_ifaddrs_enabled"
  	atf_add_test_case "member_ifaddrs_disabled"
  	atf_add_test_case "member_ifaddrs_vlan"
+-- 
+2.39.3 (Apple Git-145)
+

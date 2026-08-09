@@ -111,14 +111,30 @@ Each block below is ready to paste into `arc diff`'s editor. Supporting
 detail is in this repo's `docs/patchN-*-implementation.md` and
 `docs/patchN-*-test-result.md`.
 
-**Progress so far:** D1 → https://reviews.freebsd.org/D58729 (filed
-2026-08-08, summary added via web UI edit after the fact). D2 →
-https://reviews.freebsd.org/D58730 (filed 2026-08-08). D3 →
-https://reviews.freebsd.org/D58731 (filed 2026-08-08, summary/test plan
-added correctly via nano at creation time). Each commit gets amended by
-`arc diff` (adds `Subscribers:`/`Differential Revision:` trailers), which
-changes its hash and requires rebasing everything still ahead of it in
-the stack — the hashes below are kept current after each step.
+**Progress: all 8 revisions filed (2026-08-08 through 2026-08-09).**
+D1 → https://reviews.freebsd.org/D58729 (summary added via web UI edit
+after the fact). D2 → https://reviews.freebsd.org/D58730. D3 →
+https://reviews.freebsd.org/D58731. D4 → https://reviews.freebsd.org/D58732.
+D5 → https://reviews.freebsd.org/D58744. D6 → https://reviews.freebsd.org/D58745.
+D7 → https://reviews.freebsd.org/D58746. D8 → https://reviews.freebsd.org/D58747.
+Each commit gets amended by `arc diff` (adds `Subscribers:`/
+`Differential Revision:` trailers), which changes its hash and requires
+rebasing everything still ahead of it in the stack — the hashes below are
+the final, post-amend ones. D57559, a stale duplicate of D2 from an
+earlier attempt, was found and abandoned.
+
+Parent-revision links across the entire chain (D1→D2→D3→D4→D5→D6→D7→D8)
+are confirmed real via the Conduit API (`edge.search` with
+`revision.parent`/`revision.child` edge types, not just the cosmetic
+"Depends on Dxxx" prose text — see the note below). D1-D4's links were
+set explicitly via the "Edit Parent Revisions" UI dialog; D4→D5 through
+D7→D8 turned out to be linked automatically, apparently because each
+`arc diff <parent-hash>` picked up the `Differential Revision:` trailer
+already present on the parent commit and set the dependency itself.
+
+Reviewers: only D1 has `bms` attached. Adding him to D2-D8 is deferred by
+choice to whenever the submitter is ready — not a blocker on anything
+above.
 
 ---
 
@@ -199,7 +215,7 @@ bases; ATF passes.
 
 ---
 
-### D5 — igmp_snooping knob and counters (`75d25af5e`)
+### D5 — igmp_snooping knob and counters (`3d5f1461c`, filed as D58744)
 
 **Summary:**
 Adds the `net.link.bridge.igmp_snooping` runtime enable knob, default off —
@@ -217,7 +233,7 @@ Built and booted on both bases; ATF passes.
 
 ---
 
-### D6 — router-port learning (`63c8b8ec8`)
+### D6 — router-port learning (`3af2e81cd`, filed as D58745)
 
 **Summary:**
 Learns multicast-router ports from observed IGMP membership queries
@@ -241,7 +257,7 @@ those fixes, +1 over D5. Built and booted on both bases; ATF passes.
 
 ---
 
-### D7 — conservative IGMPv3 ASM refinement (`63b41664f`)
+### D7 — conservative IGMPv3 ASM refinement (`468c9551c`, filed as D58746)
 
 **Summary:**
 Widens the IGMPv3 record handling from D3, which created `(*,G)` state only
@@ -269,7 +285,7 @@ D6. Built and booted on both bases; ATF passes.
 
 ---
 
-### D8 — link-local 224.0.0.0/24 exemption (`478569306`)
+### D8 — link-local 224.0.0.0/24 exemption (`3e9e28c04`, filed as D58747)
 
 **Summary:**
 Neither the learn path nor the forward path excluded the link-local

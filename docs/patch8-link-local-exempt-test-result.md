@@ -168,3 +168,22 @@ the first run), this is the only one that was a genuine kernel defect —
 the rest were two bugs in the test harness itself, found and fixed while
 building the suite; see `docs/edge-case-test-suite.md` for the full
 account.
+
+---
+
+## Supplementary: suppression-efficiency benchmark
+
+After patch 8 (and the whole series) was otherwise verified, a small
+supplementary benchmark quantified the series' suppression behavior in
+concrete delivery-count terms, using `mcjoin` as the traffic generator
+per Bruce Simpson's explicit guidance during proposal review that
+suppression/correctness — not throughput — is what matters here. Full
+writeup: `docs/suppression-benchmark-result.md`. Headline result: with
+4 idle ports and a 500-packet run, snooping off delivered the full
+stream to all 4 idle ports (2000 total); snooping on delivered **zero**
+to any idle port while the real listener still received all 500 packets
+in both conditions — a 100% suppression ratio with no cost to the real
+listener. This is supplementary evidence for the project, not part of
+the Phabricator patch series itself — it quantifies behavior already
+proven correct by the ATF suite and the edge-case suite, it doesn't test
+anything new.

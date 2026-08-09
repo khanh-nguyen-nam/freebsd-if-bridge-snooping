@@ -74,7 +74,7 @@ git log --oneline main-tip..submission-main   # confirm the 8, oldest last
 For the **first** (oldest) commit:
 
 ```sh
-git checkout 7971c1802   # "if_bridge: add group_fwd_mask ioctl..."
+git checkout 97ac9f96e   # "if_bridge: add group_fwd_mask ioctl..."
 arc diff main-tip
 ```
 
@@ -87,8 +87,8 @@ For **each subsequent** commit, diff against the previous commit rather
 than `main-tip`:
 
 ```sh
-git checkout 50a945ed7   # patch 2
-arc diff 7971c1802
+git checkout ecc35d552   # patch 2
+arc diff 97ac9f96e
 ```
 
 ...repeating through all 8.
@@ -111,9 +111,18 @@ Each block below is ready to paste into `arc diff`'s editor. Supporting
 detail is in this repo's `docs/patchN-*-implementation.md` and
 `docs/patchN-*-test-result.md`.
 
+**Progress so far:** D1 → https://reviews.freebsd.org/D58729 (filed
+2026-08-08, summary added via web UI edit after the fact). D2 →
+https://reviews.freebsd.org/D58730 (filed 2026-08-08). D3 →
+https://reviews.freebsd.org/D58731 (filed 2026-08-08, summary/test plan
+added correctly via nano at creation time). Each commit gets amended by
+`arc diff` (adds `Subscribers:`/`Differential Revision:` trailers), which
+changes its hash and requires rebasing everything still ahead of it in
+the stack — the hashes below are kept current after each step.
+
 ---
 
-### D1 — group_fwd_mask (`7971c1802`)
+### D1 — group_fwd_mask (`97ac9f96e`)
 
 **Summary:**
 Adds a `group_fwd_mask` control to `if_bridge(4)` (new `BRDGGFWDMASK`/
@@ -135,7 +144,7 @@ both `stable/14` and current `main` (2026-08-07); ATF passes on both.
 
 ---
 
-### D2 — MDB foundation (`50a945ed7`)
+### D2 — MDB foundation (`ecc35d552`)
 
 **Summary:**
 Adds the multicast database (MDB) data structures to `if_bridge(4)`:
@@ -155,7 +164,7 @@ Built and booted on both bases; ATF passes.
 
 ---
 
-### D3 — IPv4 IGMP listener learning (`e6bec064e`)
+### D3 — IPv4 IGMP listener learning (`e6da718fa`)
 
 **Summary:**
 Parses IGMPv1/v2/v3 membership reports in the bridge forward path and
@@ -173,7 +182,7 @@ passes.
 
 ---
 
-### D4 — MDB-aware forwarding (`4334cc58e`)
+### D4 — MDB-aware forwarding (`66ec06b84`)
 
 **Summary:**
 IPv4 multicast data frames now perform an MDB lookup keyed by
@@ -190,7 +199,7 @@ bases; ATF passes.
 
 ---
 
-### D5 — igmp_snooping knob and counters (`9ff89868a`)
+### D5 — igmp_snooping knob and counters (`75d25af5e`)
 
 **Summary:**
 Adds the `net.link.bridge.igmp_snooping` runtime enable knob, default off —
@@ -208,7 +217,7 @@ Built and booted on both bases; ATF passes.
 
 ---
 
-### D6 — router-port learning (`a5d4cb302`)
+### D6 — router-port learning (`63c8b8ec8`)
 
 **Summary:**
 Learns multicast-router ports from observed IGMP membership queries
@@ -232,7 +241,7 @@ those fixes, +1 over D5. Built and booted on both bases; ATF passes.
 
 ---
 
-### D7 — conservative IGMPv3 ASM refinement (`8cbfa7f41`)
+### D7 — conservative IGMPv3 ASM refinement (`63b41664f`)
 
 **Summary:**
 Widens the IGMPv3 record handling from D3, which created `(*,G)` state only
@@ -260,7 +269,7 @@ D6. Built and booted on both bases; ATF passes.
 
 ---
 
-### D8 — link-local 224.0.0.0/24 exemption (`5326a6e70`)
+### D8 — link-local 224.0.0.0/24 exemption (`478569306`)
 
 **Summary:**
 Neither the learn path nor the forward path excluded the link-local
